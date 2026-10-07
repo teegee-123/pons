@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: pons-paper-trader
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m ponspaper run --no-browser --host 0.0.0.0
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: DATABASE_URL      # Postgres connection string; you paste it in the Render dashboard
+        sync: false
+      - key: PONS_DB_SAVE_SEC  # how often state, trades and recordings are written to the database
+        value: "600"
+      - key: PONS_DB_KEEP_DAYS # recordings older than this are deleted to stay inside free database storage
+        value: "10"

@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pons paper trader</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f4f2; --surface: #fcfcfb; --surface-2: #f0efec; --border: #e2e1dc;
+  --text: #0b0b0b; --text-2: #52514e; --muted: #8a8984;
+  --accent: #2a78d6; --good: #0a7d0a; --bad: #c43535; --warn: #b07800;
+  --div-pos: #2a78d6; --div-neg: #e34948; --div-mid: #f0efec;
+  --line: #2a78d6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1a19; --surface-2: #232321; --border: #2f2f2c;
+    --text: #f4f4f2; --text-2: #c3c2b7; --muted: #8a8984;
+    --accent: #3987e5; --good: #2fbf4a; --bad: #e66767; --warn: #e0a400;
+    --div-pos: #3987e5; --div-neg: #e66767; --div-mid: #383835; --line: #3987e5;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121211; --surface: #1a1a19; --surface-2: #232321; --border: #2f2f2c;
+  --text: #f4f4f2; --text-2: #c3c2b7; --muted: #8a8984;
+  --accent: #3987e5; --good: #2fbf4a; --bad: #e66767; --warn: #e0a400;
+  --div-pos: #3987e5; --div-neg: #e66767; --div-mid: #383835; --line: #3987e5;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.num, td.n, .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12px; }
+header { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; padding: 12px 16px; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 5; }
+header h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 99px; background: var(--surface-2); font-size: 12px; color: var(--text-2); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.dot.ok { background: var(--good); } .dot.bad { background: var(--bad); }
+.kpis { display: flex; flex-wrap: wrap; gap: 4px 18px; }
+.kpi { display: flex; flex-direction: column; }
+.kpi b { font-size: 14px; font-variant-numeric: tabular-nums; font-weight: 600; }
+.kpi span { font-size: 11px; color: var(--muted); }
+.spacer { flex: 1; }
+nav { display: flex; gap: 2px; padding: 0 16px; background: var(--surface); border-bottom: 1px solid var(--border); overflow-x: auto; }
+nav button { border: 0; background: none; color: var(--text-2); padding: 10px 12px; font: inherit; cursor: pointer; border-bottom: 2px solid transparent; white-space: nowrap; }
+nav button.on { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+main { padding: 16px; max-width: 1600px; margin: 0 auto; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+.card h2 { font-size: 13px; margin: 0 0 10px; font-weight: 650; }
+.card h2 small { font-weight: 400; color: var(--muted); margin-left: 6px; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.tablewrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; font-weight: 500; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .3px; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; cursor: default; }
+th.sortable { cursor: pointer; } th.sorted { color: var(--text); }
+td { padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; vertical-align: middle; }
+td.n, th.n { text-align: right; }
+tr.click { cursor: pointer; } tr.click:hover td { background: var(--surface-2); }
+tr.sel td { background: var(--surface-2); }
+.desc { color: var(--text-2); font-size: 11.5px; white-space: normal; max-width: 460px; }
+.pos { color: var(--good); } .neg { color: var(--bad); } .dim { color: var(--muted); }
+.tag { display: inline-block; font-size: 10.5px; padding: 0 6px; border-radius: 4px; background: var(--surface-2); color: var(--text-2); margin-right: 4px; }
+.tag.manual { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); }
+button.btn, a.btn { border: 1px solid var(--border); background: var(--surface); color: var(--text); padding: 5px 11px; border-radius: 7px; font: inherit; cursor: pointer; display: inline-block; }
+button.btn:hover, a.btn:hover { background: var(--surface-2); }
+button.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.btn.danger { color: var(--bad); }
+.chips button { border: 1px solid var(--border); background: var(--surface); color: var(--text-2); padding: 3px 10px; border-radius: 99px; font: inherit; cursor: pointer; }
+.chips button.on { background: var(--text); color: var(--surface); border-color: var(--text); }
+select, input[type=number], input[type=text] { background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 7px; font: inherit; }
+input[type=number] { width: 92px; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
+.form { display: grid; grid-template-columns: minmax(130px, 1fr) auto auto; gap: 6px 10px; align-items: center; }
+.form label { color: var(--text-2); }
+.form .u { color: var(--muted); font-size: 11px; }
+.form2 { display: grid; grid-template-columns: minmax(150px, 1fr) auto; gap: 6px 10px; align-items: center; }
+.help { color: var(--muted); font-size: 11.5px; margin: 0 0 10px; }
+.split { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+@media (min-width: 1200px) { .split.detail-open { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); } }
+.drawer h3 { margin: 0; font-size: 15px; }
+.statgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px; margin: 10px 0; }
+.stat { background: var(--surface-2); border-radius: 8px; padding: 7px 9px; }
+.stat span { display: block; font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .3px; }
+.stat b { font-variant-numeric: tabular-nums; font-size: 14px; font-weight: 600; }
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; }
+.tip { position: fixed; pointer-events: none; z-index: 50; background: var(--surface); border: 1px solid var(--border); border-radius: 7px; padding: 6px 9px; font-size: 12px; box-shadow: 0 4px 16px rgb(0 0 0 / .18); display: none; max-width: 320px; }
+.edgefeat { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; }
+.bar { position: relative; height: 14px; background: transparent; }
+.bar .mid { position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: var(--border); }
+.bar .fill { position: absolute; top: 1px; height: 12px; border-radius: 3px; }
+.heat td { text-align: center; font-size: 11.5px; border: 2px solid var(--surface); border-radius: 4px; padding: 7px 4px; min-width: 70px; }
+.heat th { text-align: center; }
+.empty { color: var(--muted); padding: 22px; text-align: center; }
+.legend { display: flex; gap: 10px; align-items: center; font-size: 11.5px; color: var(--text-2); }
+.legend i { display: inline-block; width: 22px; height: 10px; border-radius: 2px; }
+code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+a { color: var(--accent); text-decoration: none; }
+.hidden { display: none !important; }
+.toast { position: fixed; bottom: 16px; right: 16px; background: var(--text); color: var(--surface); padding: 8px 14px; border-radius: 8px; z-index: 60; display: none; }
+@media (max-width: 640px) { header { padding: 10px 16px; } main { padding: 12px 16px; } .form { grid-template-columns: 1fr auto auto; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>pons paper trader</h1>
+  <span class="pill"><span class="dot" id="liveDot"></span><span id="liveTxt">connecting…</span></span>
+  <div class="kpis" id="kpis"></div>
+  <div class="spacer"></div>
+  <button class="btn" id="btnTheme" title="Toggle light/dark">◐</button>
+</header>
+<nav id="tabs">
+  <button data-tab="board" class="on">Leaderboard</button>
+  <button data-tab="market">Market</button>
+  <button data-tab="edge">Edge map</button>
+  <button data-tab="trades">Trades</button>
+  <button data-tab="settings">Filters &amp; settings</button>
+  <button data-tab="backtest">Backtest</button>
+</nav>
+<main>
+  <section id="tab-board">
+    <div class="split" id="boardSplit">
+      <div>
+        <div class="card">
+          <div class="row" style="margin-bottom:10px">
+            <h2 style="margin:0">Strategies <small id="boardSub"></small></h2>
+            <div class="spacer"></div>
+            <div class="chips" id="kindChips"><button data-k="all" class="on">All</button><button data-k="manual">Manual</button><button data-k="auto">Auto</button></div>
+            <button class="btn primary" id="btnNew">+ New strategy</button>
+            <button class="btn" id="btnEvolve" title="Run an evolution epoch now">Evolve now</button>
+          </div>
+          <p class="help">Every strategy trades the same live feed with its own $ bankroll. <b>Score</b> = average net return per trade after all fees, price impact, gas and latency, shrunk toward 0 when there are few trades (open positions count half). Auto strategies are bred from the best performers and the worst are retired every epoch.</p>
+          <div class="tablewrap"><table id="boardTbl"></table></div>
+        </div>
+        <div class="grid2">
+          <div class="card"><h2>Hall of fame <small>best auto strategies seen</small></h2><div class="tablewrap"><table id="hallTbl"></table></div></div>
+          <div class="card"><h2>Recently retired</h2><div class="tablewrap"><table id="retiredTbl"></table></div></div>
+        </div>
+      </div>
+      <div id="detail" class="card drawer hidden"></div>
+    </div>
+  </section>
+
+  <section id="tab-market" class="hidden">
+    <div class="card">
+      <div class="row" style="margin-bottom:8px"><h2 style="margin:0">Live tokens <small id="mktSub"></small></h2><div class="spacer"></div>
+        <label class="dim"><input type="checkbox" id="mktUni"> only tokens in the trading universe</label></div>
+      <div class="tablewrap"><table id="mktTbl"></table></div>
+    </div>
+  </section>
+
+  <section id="tab-edge" class="hidden">
+    <div class="card">
+      <div class="row" style="margin-bottom:6px">
+        <h2 style="margin:0">Edge map <small id="edgeSub"></small></h2><div class="spacer"></div>
+        <span class="dim">Hold for</span><div class="chips" id="hChips"></div>
+      </div>
+      <p class="help">Strategy-independent: every universe token is sampled every couple of minutes as a hypothetical buy, then valued as a sell after each horizon, net of fees, impact and gas. Buckets with a higher average than the baseline are conditions worth building a strategy around. Faded rows have fewer than 20 samples.</p>
+      <div id="edgeBase" class="statgrid"></div>
+    </div>
+    <div class="card"><h2>Age × market cap <small>average net return per cell</small></h2>
+      <div class="legend" id="heatLegend"></div>
+      <div class="tablewrap" style="margin-top:8px"><table class="heat" id="heatTbl"></table></div></div>
+    <div class="edgefeat" id="edgeFeats"></div>
+  </section>
+
+  <section id="tab-trades" class="hidden">
+    <div class="card"><div class="row" style="margin-bottom:10px"><h2 style="margin:0">Closed trades <small>all strategies, newest first</small></h2><div class="spacer"></div>
+      <a class="btn" href="/download/trades.csv" download>Download all trades (CSV)</a></div><div class="tablewrap"><table id="closedTbl"></table></div></div>
+    <div class="card"><h2>Fills <small>every order incl. reverts; latency = signal → on-chain state read</small></h2><div class="tablewrap"><table id="fillsTbl"></table></div></div>
+  </section>
+
+  <section id="tab-settings" class="hidden">
+    <div class="grid2">
+      <div class="card"><h2>Trading universe <small>applies to every strategy</small></h2>
+        <p class="help">Global filters for what we will trade at all. Strategy filters (and the auto-search) only narrow inside this. Leave a box empty to ignore it.</p>
+        <div id="uniForm"></div></div>
+      <div>
+        <div class="card"><h2>Execution: fees &amp; latency</h2><div class="form2" id="exForm"></div></div>
+        <div class="card"><h2>Default sizing <small>new strategies</small></h2><div class="form2" id="sizeForm"></div></div>
+      </div>
+      <div>
+        <div class="card"><h2>Evolution</h2><div class="form2" id="evoForm"></div></div>
+        <div class="card"><h2>Polling, edge map &amp; recording</h2><div class="form2" id="pollForm"></div></div>
+      </div>
+    </div>
+    <div class="row"><button class="btn primary" id="btnSaveSettings">Save settings</button><span class="dim" id="setMsg"></span><div class="spacer"></div>
+      <button class="btn danger" id="btnResetAll">Reset all strategies &amp; stats</button></div>
+  </section>
+
+  <section id="tab-backtest" class="hidden">
+    <div class="card"><h2>Backtest on recorded data</h2>
+      <p class="help">The live trader records every poll. Replay the recording to evolve a large population in seconds (fills at the first recorded snapshot after the latency, model pricing):</p>
+      <p><code>python -m ponspaper replay --population 200</code></p>
+      <p class="help">When running on a server (e.g. Render), download the recording and replay it on your own PC: <a class="btn" href="/download/snapshots.jsonl.gz" download>Download recording</a> then <code>python -m ponspaper replay pons_snapshots.jsonl.gz</code></p>
+      <p class="help">Results appear below. <b>Adopt</b> copies a strategy into the live paper trader as a manual strategy so it is tested forward on fresh data, which is the real test against overfitting.</p>
+      <div id="btMeta" class="dim"></div>
+      <div class="tablewrap"><table id="btTbl"></table></div></div>
+  </section>
+</main>
+<div class="tip" id="tip"></div>
+<div class="toast" id="toast"></div>
+<script src="app.js"></script>
+<script src="views.js"></script>
+</body>
+</html>

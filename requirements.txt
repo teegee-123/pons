@@ -1,0 +1,2 @@
+# Only needed when DATABASE_URL is set (e.g. on Render). Local runs need no packages.
+psycopg[binary]>=3.2
