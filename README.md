@@ -46,8 +46,8 @@ after fees, impact and gas. A fresh position therefore starts around âˆ’4% to âˆ
 connection string into `DATABASE_URL` when asked.
 
 - **Storage:** Render's free disk is wiped on every restart, so with `DATABASE_URL` set, state, trades and
-  recordings go to Postgres. They're written every 10 minutes (`PONS_DB_SAVE_SEC`), plus on shutdown; a crash can
-  lose up to 10 minutes. Recordings older than 10 days are deleted (`PONS_DB_KEEP_DAYS`).
+  recordings go to Postgres. They're written every 15 minutes (`PONS_DB_SAVE_SEC`), plus on shutdown; a crash can
+  lose up to 15 minutes. Recordings older than 10 days are deleted (`PONS_DB_KEEP_DAYS`).
 - **Staying awake:** free services sleep after 15 minutes without visitors. Point an uptime monitor (e.g.
   UptimeRobot, every 5 minutes) at `https://<your-service>.onrender.com/health`.
 - **Downloads:** the Trades tab downloads every trade as CSV; the Backtest tab downloads the recording. Replay it
