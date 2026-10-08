@@ -1,5 +1,6 @@
 """Filter definitions, strategy specs, and the random/mutation operators used by the evolver."""
 import copy
+import json
 import random
 import time
 import uuid
@@ -33,6 +34,7 @@ EXIT_FIELDS = {
     "trailArmPct": ("Trail arms at", "%", "Net return at which the trailing stop becomes active"),
     "maxHoldMin":  ("Max hold", "min", "Sell after this many minutes regardless"),
     "staleMin":    ("Stale exit", "min", "Sell if nobody has traded the token for this long"),
+    "stuckMin":    ("Time stop", "min", "Sell if the position has been under water (net return below 0) for this long"),
 }
 SIZING_FIELDS = {
     "sizeUsd":     ("Position size", "$", "USD spent per entry (fees come out of this)"),
@@ -92,7 +94,8 @@ def _num(x):
         return None
 
 
-DEFAULT_EXITS = {"tpPct": 50.0, "slPct": 25.0, "trailPct": None, "trailArmPct": 15.0, "maxHoldMin": 30.0, "staleMin": 10.0}
+DEFAULT_EXITS = {"tpPct": 50.0, "slPct": 25.0, "trailPct": None, "trailArmPct": 15.0, "maxHoldMin": 30.0, "staleMin": 10.0,
+                 "stuckMin": None}
 DEFAULT_SIZING = {"sizeUsd": 50.0, "maxOpen": 5, "bankrollUsd": 1000.0, "cooldownMin": 60.0}
 
 
@@ -147,7 +150,9 @@ SPACE = [
     ("exits.trailArmPct",       [0, 5, 10, 20, 40, 80], 1.0),
     ("exits.maxHoldMin",        [1, 2, 5, 10, 15, 30, 60, 120, 240], 1.0),
     ("exits.staleMin",          [1, 2, 5, 10, 20], 0.6),
+    ("exits.stuckMin",          [2, 3, 5, 10, 20, 45, 90], 0.5),
 ]
+GENE_PATHS = [g[0] for g in SPACE]
 
 
 def _get(spec, path):
@@ -254,5 +259,56 @@ def describe(spec):
     xs = [f"tp{ex.get('tpPct'):g}" if ex.get("tpPct") is not None else None,
           f"sl{ex.get('slPct'):g}" if ex.get("slPct") is not None else None,
           f"tr{ex.get('trailPct'):g}@{(ex.get('trailArmPct') or 0):g}" if ex.get("trailPct") is not None else None,
-          f"{ex.get('maxHoldMin'):g}m" if ex.get("maxHoldMin") is not None else None]
+          f"{ex.get('maxHoldMin'):g}m" if ex.get("maxHoldMin") is not None else None,
+          f"ts{ex.get('stuckMin'):g}m" if ex.get("stuckMin") is not None else None]
     return (" | ".join(parts) or "any token") + "  ->  " + " ".join(x for x in xs if x)
+
+
+# ---------------------------------------------------------------------------------------------
+# Genetic-algorithm operators (used by the lab)
+# ---------------------------------------------------------------------------------------------
+def genome(spec):
+    """The evolvable part of a spec."""
+    return _finish({"filters": copy.deepcopy(spec.get("filters", {})), "exits": copy.deepcopy(spec.get("exits", {}))})
+
+
+def genome_key(g):
+    """Canonical text for a genome, so identical rule sets are recognised as duplicates."""
+    f = {k: v for k, v in sorted((g.get("filters") or {}).items()) if v and any(x is not None for x in v.values())}
+    ex = {k: v for k, v in sorted((g.get("exits") or {}).items()) if v is not None}
+    return json.dumps({"f": f, "x": ex}, sort_keys=True)
+
+
+def crossover(a, b, rng=random):
+    """Uniform crossover. A filter's min/max travel together so ranges stay coherent."""
+    child = {"filters": {}, "exits": {}}
+    for key in sorted(set(a.get("filters", {})) | set(b.get("filters", {}))):
+        src = a if rng.random() < 0.5 else b
+        if key in src.get("filters", {}):
+            child["filters"][key] = copy.deepcopy(src["filters"][key])
+    for key in set(a.get("exits", {})) | set(b.get("exits", {})):
+        src = a if rng.random() < 0.5 else b
+        child["exits"][key] = src.get("exits", {}).get(key)
+    return _finish(child)
+
+
+def mutate_genes(g, rate, rng=random):
+    """Per-gene mutation: each gene independently, with probability `rate`, steps to a neighbouring value
+    (80%), jumps anywhere (10%) or toggles on/off (10%). At least one gene always changes."""
+    s = {"filters": copy.deepcopy(g.get("filters", {})), "exits": copy.deepcopy(g.get("exits", {}))}
+    picks = [gene for gene in SPACE if rng.random() < rate] or [rng.choice(SPACE)]
+    for path, values, p_on in picks:
+        cur = _get(s, path)
+        r = rng.random()
+        if cur is None:
+            _set(s, path, copy.deepcopy(rng.choice(values)))
+        elif r < 0.1 and path not in ("exits.tpPct", "exits.maxHoldMin"):
+            _set(s, path, None)
+        else:
+            try:
+                i = values.index(cur)
+            except ValueError:
+                i = rng.randrange(len(values))
+            j = rng.randrange(len(values)) if r > 0.9 else min(len(values) - 1, max(0, i + rng.choice([-1, 1])))
+            _set(s, path, copy.deepcopy(values[j]))
+    return _finish(s)

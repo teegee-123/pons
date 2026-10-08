@@ -97,6 +97,18 @@ class FileStore:
         except OSError:
             return (",".join(TRADE_FIELDS) + "\n").encode()
 
+    def snapshot_lines(self, since):
+        """Recorded lines from hourly files that may contain data newer than `since` (unix time)."""
+        cut = datetime.fromtimestamp(since).strftime("%Y-%m-%d_%H")
+        for path in sorted(glob.glob(self._p(os.path.join("snapshots", "*.jsonl.gz")))):
+            if os.path.basename(path)[:13] < cut:
+                continue
+            try:
+                with gzip.open(path, "rt", encoding="utf8") as fh:
+                    yield from fh
+            except (OSError, EOFError):
+                continue
+
     def snapshots_gz(self):
         """All recordings as one multi-member gzip stream (readable by `replay`)."""
         out = io.BytesIO()
@@ -117,6 +129,7 @@ class PgStore:
         self.save_every = float(os.environ.get("PONS_DB_SAVE_SEC", "600"))
         self.keep_days = float(os.environ.get("PONS_DB_KEEP_DAYS", "10"))
         self._lock = threading.Lock()
+        self._db_lock = threading.RLock()
         self._trades = []
         self._snaps = []
         self._state = None
@@ -133,6 +146,10 @@ class PgStore:
         return self._conn.cursor()
 
     def _run(self, fn):
+        with self._db_lock:  # one connection shared by the poller, the lab and HTTP threads
+            return self._run_locked(fn)
+
+    def _run_locked(self, fn):
         for attempt in range(2):
             try:
                 with self._db() as c:
@@ -212,6 +229,18 @@ class PgStore:
         for r in pending:
             w.writerow([r.get(k, "") for k in TRADE_FIELDS])
         return out.getvalue().encode()
+
+    def snapshot_lines(self, since):
+        """Recorded lines newer than roughly `since`, chunk by chunk, then whatever is still buffered."""
+        ids = self._run(lambda c: (c.execute("select id from pons_snapshots where t >= to_timestamp(%s) order by id",
+                                             (since - self.save_every,)), c.fetchall())[1]) or []
+        for (i,) in ids:
+            row = self._run(lambda c: (c.execute("select data from pons_snapshots where id=%s", (i,)), c.fetchone())[1])
+            if row:
+                yield from gzip.decompress(bytes(row[0])).decode().splitlines()
+        with self._lock:
+            pending = list(self._snaps)
+        yield from pending
 
     def snapshots_gz(self):
         rows = self._run(lambda c: (c.execute("select data from pons_snapshots order by id"), c.fetchall())[1]) or []

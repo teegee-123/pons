@@ -44,7 +44,7 @@ def spot_usd(d):
 
 
 class Token:
-    __slots__ = ("addr", "d", "first_seen", "updated", "hist", "_t")
+    __slots__ = ("addr", "d", "first_seen", "updated", "hist", "_t", "_peak", "_peak_t")
 
     def __init__(self, addr, d, now):
         self.addr = addr
@@ -53,6 +53,7 @@ class Token:
         self.updated = now
         self.hist = []   # (t, spot_usd, volume_usd, trade_count)
         self._t = []     # parallel list of t for bisect
+        self._peak, self._peak_t = 0.0, 0.0  # running max of spot over the history window
         created = d.get("createdAt") or now
         thr = d.get("thresholdQuote") or 0
         if d.get("stage") != "graduated" and thr > 0 and now - created < HIST_SEC and d.get("quoteUsd"):
@@ -65,6 +66,8 @@ class Token:
             return
         self.hist.append((t, px, vol, trades))
         self._t.append(t)
+        if px >= self._peak:
+            self._peak, self._peak_t = px, t
 
     def _sample(self, now):
         d = self.d
@@ -88,6 +91,9 @@ class Token:
             if i:
                 del self.hist[:i]
                 del self._t[:i]
+                if self._peak_t < self._t[0]:  # the peak aged out: rescan (rare)
+                    j = max(range(len(self.hist)), key=lambda k: self.hist[k][1])
+                    self._peak, self._peak_t = self.hist[j][1], self.hist[j][0]
         return changed
 
     def at(self, t):
@@ -126,7 +132,7 @@ class Token:
         else:
             f["tpm1"] = f["vol1m"] = None
         if self.hist and px:
-            peak = max(x[1] for x in self.hist)
+            peak = max(self._peak, px)
             f["ddPeak"] = max(0.0, (1.0 - px / peak) * 100.0) if peak > 0 else None
         else:
             f["ddPeak"] = None

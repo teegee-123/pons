@@ -11,7 +11,7 @@
   --text: #0b0b0b; --text-2: #52514e; --muted: #8a8984;
   --accent: #2a78d6; --good: #0a7d0a; --bad: #c43535; --warn: #b07800;
   --div-pos: #2a78d6; --div-neg: #e34948; --div-mid: #f0efec;
-  --line: #2a78d6;
+  --line: #2a78d6; --series-1: #2a78d6; --series-2: #eb6834;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -19,7 +19,7 @@
     --bg: #121211; --surface: #1a1a19; --surface-2: #232321; --border: #2f2f2c;
     --text: #f4f4f2; --text-2: #c3c2b7; --muted: #8a8984;
     --accent: #3987e5; --good: #2fbf4a; --bad: #e66767; --warn: #e0a400;
-    --div-pos: #3987e5; --div-neg: #e66767; --div-mid: #383835; --line: #3987e5;
+    --div-pos: #3987e5; --div-neg: #e66767; --div-mid: #383835; --line: #3987e5; --series-1: #3987e5; --series-2: #d95926;
   }
 }
 :root[data-theme="dark"] {
@@ -27,7 +27,7 @@
   --bg: #121211; --surface: #1a1a19; --surface-2: #232321; --border: #2f2f2c;
   --text: #f4f4f2; --text-2: #c3c2b7; --muted: #8a8984;
   --accent: #3987e5; --good: #2fbf4a; --bad: #e66767; --warn: #e0a400;
-  --div-pos: #3987e5; --div-neg: #e66767; --div-mid: #383835; --line: #3987e5;
+  --div-pos: #3987e5; --div-neg: #e66767; --div-mid: #383835; --line: #3987e5; --series-1: #3987e5; --series-2: #d95926;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -113,6 +113,7 @@ a { color: var(--accent); text-decoration: none; }
 <nav id="tabs">
   <button data-tab="board" class="on">Leaderboard</button>
   <button data-tab="market">Market</button>
+  <button data-tab="lab">Genetic lab</button>
   <button data-tab="edge">Edge map</button>
   <button data-tab="trades">Trades</button>
   <button data-tab="settings">Filters &amp; settings</button>
@@ -150,6 +151,22 @@ a { color: var(--accent); text-decoration: none; }
     </div>
   </section>
 
+  <section id="tab-lab" class="hidden">
+    <div class="card">
+      <div class="row" style="margin-bottom:6px"><h2 style="margin:0">Genetic lab <small id="labSub"></small></h2><div class="spacer"></div>
+        <button class="btn" id="btnLabRebuild" title="Reload the recorded data window now">Rebuild dataset</button></div>
+      <p class="help">Evolves strategies on the <b>recorded</b> market data instead of waiting hours for live trades: tournament selection, crossover, mutation (the rate rises automatically when progress stalls), elitism, random immigrants, and clone removal. The older part of the data window trains; the most recent part is held back for validation. Only genomes profitable on <i>both</i> become champions, and champions are injected into the live population at each live evolution epoch, where live trading is the final test. <b>Fitness</b> = average net return per trade minus one standard error, so a few lucky trades can't win.</p>
+      <div class="statgrid" id="labStats"></div>
+      <div id="labErr" class="neg" style="font-size:12px"></div>
+    </div>
+    <div class="card"><h2>Fitness by generation <small>training data</small></h2>
+      <div class="legend" id="labLegend"></div><div class="chart" id="labChart" style="margin-top:6px"></div></div>
+    <div class="card"><h2>Validated champions <small>profitable on training and validation data</small></h2>
+      <div class="tablewrap"><table id="labHall"></table></div></div>
+    <div class="card"><h2>Current generation <small>top 12 by training fitness</small></h2>
+      <div class="tablewrap"><table id="labTop"></table></div></div>
+  </section>
+
   <section id="tab-edge" class="hidden">
     <div class="card">
       <div class="row" style="margin-bottom:6px">
@@ -181,7 +198,8 @@ a { color: var(--accent); text-decoration: none; }
         <div class="card"><h2>Default sizing <small>new strategies</small></h2><div class="form2" id="sizeForm"></div></div>
       </div>
       <div>
-        <div class="card"><h2>Evolution</h2><div class="form2" id="evoForm"></div></div>
+        <div class="card"><h2>Live evolution</h2><div class="form2" id="evoForm"></div></div>
+        <div class="card"><h2>Genetic lab</h2><div class="form2" id="labForm"></div></div>
         <div class="card"><h2>Polling, edge map &amp; recording</h2><div class="form2" id="pollForm"></div></div>
       </div>
     </div>
@@ -203,5 +221,6 @@ a { color: var(--accent); text-decoration: none; }
 <div class="toast" id="toast"></div>
 <script src="app.js"></script>
 <script src="views.js"></script>
+<script src="lab.js"></script>
 </body>
 </html>

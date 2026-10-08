@@ -76,7 +76,8 @@ def liquidation_usd(d, tokens, ex):
 
 class Position:
     __slots__ = ("id", "addr", "symbol", "t_entry", "tokens", "cost_usd", "entry_spot_usd", "feats", "peak_ret",
-                 "mark_usd", "mark_ret", "exiting", "sell_fails", "stage", "entry_drift", "fees_usd", "src")
+                 "mark_usd", "mark_ret", "exiting", "sell_fails", "stage", "entry_drift", "fees_usd", "src",
+                 "under_since")
 
     def __init__(self, **kw):
         for k in self.__slots__:

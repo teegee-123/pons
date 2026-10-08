@@ -19,8 +19,12 @@ from .market import Market, socials_count, spot_usd
 from .net import Client, HttpError
 from .sim import Portfolio, Position, liquidation_usd, model_venue
 from .store import open_store
+from .lab import DEFAULT_LAB, Lab
+
+CONFIG_VERSION = 2
 
 DEFAULT_CONFIG = {
+    "configVersion": CONFIG_VERSION,
     "apiBase": "https://ponsfamily.com",
     "rpcUrl": "https://ponsfamily.com/api/rpc",
     "poll": {"intervalSec": 2.0, "pages": 1, "sort": "active", "refreshCap": 6, "heldRefreshSec": 60.0},
@@ -36,8 +40,10 @@ DEFAULT_CONFIG = {
     },
     "universe": {"quote": {"in": ["ETH"]}, "ageMin": {"min": None, "max": 1440}},
     "sizing": {"sizeUsd": 50.0, "maxOpen": 5, "bankrollUsd": 1000.0, "cooldownMin": 60.0},
-    "evolution": {"enabled": True, "population": 40, "epochMin": 20, "minTrades": 6, "cullFrac": 0.3,
-                  "mutateFrac": 0.7, "idleEpochs": 3, "shrinkK": 5},
+    "evolution": {"enabled": True, "population": 40, "epochMin": 10, "minTrades": 6, "judgeAfterMin": 60,
+                  "cullFrac": 0.3, "mutateFrac": 0.7, "idleEpochs": 3, "shrinkK": 5, "stuckMin": 45,
+                  "retireClones": True},
+    "lab": DEFAULT_LAB,
     "edge": {"enabled": True, "sampleEverySec": 120, "horizonsMin": [1, 5, 15, 30], "sizeUsd": 50.0},
     "record": {"enabled": True},
 }
@@ -85,13 +91,26 @@ class Run:
         return any(p.addr == addr for p in self.pf.positions.values())
 
     def score(self, k=5):
-        """Expected net return per trade (%), shrunk toward 0 by k phantom zero-return trades; open positions
-        count half."""
+        """Mark-to-market expected net return per trade (%): closed trades plus open positions valued at what
+        selling now would return, shrunk toward 0 by k phantom zero-return trades."""
         s = self.pf.stats
         opens = list(self.pf.positions.values())
-        tot = s["sum_ret"] + 0.5 * sum(p.mark_ret for p in opens)
-        cnt = s["n"] + 0.5 * len(opens)
+        tot = s["sum_ret"] + sum(p.mark_ret for p in opens)
+        cnt = s["n"] + len(opens)
         return 100.0 * tot / (cnt + k) if cnt else 0.0
+
+    def mtm_pnl(self):
+        return self.pf.stats["realized"] + self.pf.unrealized()
+
+    def stuck_minutes(self, now):
+        """Longest time any open position has been continuously under water."""
+        return max(((now - p.under_since) / 60.0 for p in self.pf.positions.values() if p.under_since), default=0.0)
+
+    def signature(self):
+        """Recent entries (token, second). Strategies with the same signature are making the same trades."""
+        ents = [(t["addr"], round(t["tIn"])) for t in list(self.pf.trades)[:10]]
+        ents += [(p.addr, round(p.t_entry)) for p in self.pf.positions.values()]
+        return tuple(sorted(ents)) if len(ents) >= 5 else None
 
     def to_dict(self):
         return {"spec": self.spec, "pf": self.pf.to_dict(),
@@ -111,7 +130,11 @@ class Engine:
         if cfg is not None:
             self.cfg = deep_merge(DEFAULT_CONFIG, cfg)
         elif live and not fresh:
-            self.cfg = deep_merge(DEFAULT_CONFIG, self.store.load_config() or {})
+            saved = self.store.load_config() or {}
+            self.cfg = deep_merge(DEFAULT_CONFIG, saved)
+            if saved and saved.get("configVersion", 1) < 2:  # v2: faster live epochs to go with stuck/clone retirement
+                self.cfg["evolution"]["epochMin"] = DEFAULT_CONFIG["evolution"]["epochMin"]
+            self.cfg["configVersion"] = CONFIG_VERSION
         self.market = Market()
         self.runs = {}
         self.fills = deque(maxlen=400)
@@ -133,6 +156,8 @@ class Engine:
         self._rec_meta = set()
         self._rec_file = None
         self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=4) if live else None
+        self.lab = Lab(self.cfg, random.Random(seed)) if live else None
+        self._lab_rebuild = True
         if live and not fresh:
             self._load_state()
         if not self.runs:
@@ -184,7 +209,8 @@ class Engine:
         with self.lock:
             doc = {"version": 1, "savedAt": time.time(), "runs": [r.to_dict() for r in self.runs.values()],
                    "hall": self.hall, "retired": list(self.retired), "epoch": self.epoch, "lastEpoch": self.last_epoch,
-                   "edge": self.edge.to_dict(), "fills": list(self.fills)[:200], "closed": list(self.closed)[:200]}
+                   "edge": self.edge.to_dict(), "fills": list(self.fills)[:200], "closed": list(self.closed)[:200],
+                   "lab": self.lab.to_dict() if self.lab else None}
             text = json.dumps(doc, separators=(",", ":"), default=_json_default)
         self.store.save_state(text)
         self.store.flush()
@@ -204,12 +230,61 @@ class Engine:
         self.edge.load(doc.get("edge"))
         self.fills = deque(doc.get("fills", []), maxlen=400)
         self.closed = deque(doc.get("closed", []), maxlen=400)
+        if self.lab is not None:
+            try:
+                self.lab.load(doc.get("lab"))
+            except Exception as e:
+                self.lab.last_error = f"could not restore lab state: {e!r}"
 
     # ------------------------------------------------------------------ live loop
     def start(self):
         t = threading.Thread(target=self._loop, name="poller", daemon=True)
         t.start()
+        if self.lab is not None:
+            threading.Thread(target=self._lab_loop, name="lab", daemon=True).start()
         return t
+
+    def _lab_loop(self):
+        """Background GA on recorded data. Sleeps between evaluations so it uses about `duty` of one CPU and
+        never starves the live poller."""
+        lab = self.lab
+        while not self.stopping.is_set():
+            lc = self.cfg["lab"]
+            if not lc.get("enabled", True):
+                lab.phase = "off"
+                self.stopping.wait(5)
+                continue
+            duty = min(1.0, max(0.05, float(lc.get("duty", 0.5))))
+
+            def throttle(dt, duty=duty):
+                time.sleep(dt * (1.0 - duty) / duty)
+            try:
+                stale = lab.ds is None or time.time() - lab.ds.built_at > lc["rebuildMin"] * 60
+                if self._lab_rebuild or stale:
+                    self._lab_rebuild = False
+                    since = time.time() - lc["windowHours"] * 3600
+                    lab.build(snapshot_records(self.store.snapshot_lines(since)), yield_every=(1.0 - duty) / duty * 0.25)
+                    lab.last_error = None
+                    if not lab.pop:
+                        with self.lock:
+                            seeds = [r.spec for r in self.runs.values()] + [h["spec"] for h in self.hall if h.get("spec")]
+                        lab.seed(seeds)
+                if lab.gens_on_data >= lc.get("maxGensPerData", 50):
+                    # more generations on the same data only overfit it: wait for the next refresh
+                    lab.phase = "waiting for new data"
+                    self.stopping.wait(10)
+                    continue
+                lab.phase = "evolving"
+                lab.step(throttle)
+            except ValueError as e:  # not enough recorded data yet
+                lab.last_error = str(e)
+                self._lab_rebuild = True
+                self.stopping.wait(300)
+            except Exception as e:
+                lab.last_error = f"{_iso(time.time())} {e!r}"
+                lab.phase = "error (retrying)"
+                self._lab_rebuild = True
+                self.stopping.wait(60)
 
     def stop(self):
         self.stopping.set()
@@ -385,6 +460,10 @@ class Engine:
                 pos.mark_usd = liquidation_usd(d, pos.tokens, ex)
                 pos.mark_ret = pos.mark_usd / pos.cost_usd - 1.0 if pos.cost_usd else 0.0
                 pos.peak_ret = max(pos.peak_ret, pos.mark_ret)
+                if pos.mark_ret < 0:
+                    pos.under_since = pos.under_since or now
+                else:
+                    pos.under_since = None
                 if pos.exiting:
                     continue
                 reason = self._exit_reason(xs, pos, d, now)
@@ -405,6 +484,8 @@ class Engine:
             return "max hold"
         if xs.get("staleMin") is not None and now - (d.get("lastTradeAt") or now) >= xs["staleMin"] * 60:
             return "stale"
+        if xs.get("stuckMin") is not None and pos.under_since and now - pos.under_since >= xs["stuckMin"] * 60:
+            return "time stop"
         return None
 
     # ------------------------------------------------------------------ fills
@@ -498,6 +579,8 @@ class Engine:
 
     # ------------------------------------------------------------------ evolution
     def evolve(self, now=None):
+        """Retire auto strategies that are losing, stuck, cloned or idle; refill with lab champions, then
+        mutations of the live winners, then random genomes."""
         now = now or time.time()
         with self.lock:
             ev = self.cfg["evolution"]
@@ -505,24 +588,82 @@ class Engine:
             self.epoch += 1
             self.last_epoch = now
             autos = [r for r in self.runs.values() if r.spec["kind"] == "auto"]
-            judged = sorted([r for r in autos if r.pf.stats["n"] >= ev["minTrades"]], key=lambda r: r.score(k))
-            idle_after = ev["idleEpochs"] * ev["epochMin"] * 60
-            idle = [r for r in autos if r.pf.stats["n"] == 0 and not r.pf.positions and not r.pf.reserved
-                    and now - r.spec.get("created", now) >= idle_after]
+            age = lambda r: (now - r.spec.get("created", now)) / 60.0
+            # judged once it has enough closed trades OR has been alive long enough with any exposure
+            judged = [r for r in autos if r.pf.stats["n"] >= ev["minTrades"]
+                      or (age(r) >= ev["judgeAfterMin"] and r.pf.stats["n"] + len(r.pf.positions) > 0)]
+            judged.sort(key=lambda r: r.score(k))
+            retire = {}
             n_cull = int(len(judged) * ev["cullFrac"]) if len(judged) >= 4 else 0
-            losers = [r for r in judged[:n_cull] if r.score(k) < 0 or len(judged) >= ev["population"] * 0.6]
+            for r in judged[:n_cull]:
+                if r.score(k) < 0:
+                    retire[r.spec["id"]] = (r, "underperformed")
+            for r in autos:
+                if r.stuck_minutes(now) >= ev["stuckMin"] and r.mtm_pnl() < 0:
+                    retire.setdefault(r.spec["id"], (r, f"stuck: a position under water for {r.stuck_minutes(now):.0f}m"))
+            if ev.get("retireClones", True):
+                seen = {}
+                for r in sorted(autos, key=lambda r: r.spec.get("created", 0)):
+                    sig = r.signature()
+                    if sig is None:
+                        continue
+                    if sig in seen:
+                        retire.setdefault(r.spec["id"], (r, f"clone of {seen[sig]}"))
+                    else:
+                        seen[sig] = r.spec["name"]
+            idle_after = ev["idleEpochs"] * ev["epochMin"] * 60
+            for r in autos:
+                if (r.pf.stats["n"] == 0 and not r.pf.positions and not r.pf.reserved
+                        and now - r.spec.get("created", now) >= idle_after):
+                    retire.setdefault(r.spec["id"], (r, "never traded"))
+            # never wipe out more than half the population in one epoch
+            victims = sorted(retire.values(), key=lambda x: x[0].score(k))[: max(1, len(autos) // 2)]
             for r in judged:
                 self._hall_update(r, k, now)
             parents = judged[-max(1, len(judged) // 4):] if judged else []
-            parents = [p for p in parents if p.score(k) > 0] or parents
-            for r, why in [(r, "underperformed") for r in losers] + [(r, "never traded") for r in idle]:
+            parents = [p for p in parents if p.score(k) > 0 and p.spec["id"] not in retire] or [
+                p for p in parents if p.spec["id"] not in retire]
+            for r, why in victims:
                 if r.spec["id"] not in self.runs:
                     continue
-                self.retired.appendleft({"id": r.spec["id"], "name": r.spec["name"], "desc": S.describe(r.spec),
-                                         "gen": r.spec.get("gen", 0), "score": r.score(k), "summary": r.pf.summary(),
-                                         "at": now, "why": why})
-                del self.runs[r.spec["id"]]
+                self._retire(r, why, now)
+            self._inject_lab_champions()
             self._fill_population(parents)
+
+    def _retire(self, r, why, now):
+        k = self.cfg["evolution"]["shrinkK"]
+        self.retired.appendleft({"id": r.spec["id"], "name": r.spec["name"], "desc": S.describe(r.spec),
+                                 "gen": r.spec.get("gen", 0), "score": r.score(k), "summary": r.pf.summary(),
+                                 "at": now, "why": why})
+        del self.runs[r.spec["id"]]
+
+    def _inject_lab_champions(self, force_keys=None):
+        """Add validated lab genomes to the live population, using free slots or replacing the weakest auto
+        strategy when the population is full."""
+        if self.lab is None:
+            return []
+        lc = self.cfg["lab"]
+        if force_keys:
+            picks = [h for h in self.lab.hall if h["key"] in force_keys]
+        else:
+            picks = self.lab.champions(int(lc["promoteCount"]))
+        k = self.cfg["evolution"]["shrinkK"]
+        added = []
+        live_keys = {S.genome_key(S.genome(r.spec)) for r in self.runs.values()}
+        for h in picks:
+            if h["key"] in live_keys:
+                self.lab.deployed.add(h["key"])
+                continue
+            autos = sorted((r for r in self.runs.values() if r.spec["kind"] == "auto"), key=lambda r: r.score(k))
+            if autos and len(autos) >= int(self.cfg["evolution"]["population"]):
+                self._retire(autos[0], "replaced by a lab champion", time.time())
+            spec = S.normalize({"kind": "auto", "filters": h["genome"]["filters"], "exits": h["genome"]["exits"],
+                                "gen": h.get("gen", 0), "origin": "lab"}, self.cfg["sizing"])
+            spec["name"] = f"L-{spec['id'][2:7]} g{h.get('gen', 0)}"
+            self.runs[spec["id"]] = Run(spec)
+            self.lab.deployed.add(h["key"])
+            added.append(spec)
+        return added
 
     def _hall_update(self, r, k, now):
         entry = {"id": r.spec["id"], "name": r.spec["name"], "desc": S.describe(r.spec), "spec": r.spec,
@@ -656,8 +797,28 @@ class Engine:
             self.edge.cfg = self.cfg["edge"]
             if "evolution" in patch:
                 self._fill_population()
+            if self.lab is not None:
+                self.lab.cfg = self.cfg
+                lab_data_keys = {"windowHours", "sampleEverySec", "validateFrac"}
+                if {"universe", "execution", "sizing"} & set(patch) or lab_data_keys & set(patch.get("lab") or {}):
+                    self._lab_rebuild = True
             self.save_config()
             return self.cfg
+
+    def lab_view(self):
+        if self.lab is None:
+            return {"phase": "off"}
+        with self.lock:
+            v = self.lab.view()
+        v["cfg"] = self.cfg["lab"]
+        return v
+
+    def lab_deploy(self, key):
+        with self.lock:
+            return self._inject_lab_champions(force_keys={key})
+
+    def lab_rebuild(self):
+        self._lab_rebuild = True
 
     def upsert_strategy(self, spec):
         with self.lock:
@@ -684,6 +845,10 @@ class Engine:
                 h = next((h for h in self.hall if h["id"] == sid), None)
                 if not h:
                     return None
+                key = S.genome_key(S.genome(h["spec"]))
+                for r in self.runs.values():
+                    if S.genome_key(S.genome(r.spec)) == key:
+                        return r.spec
                 spec = dict(h["spec"], kind="manual", name=h["name"] + " (revived)")
                 spec.pop("id", None)
                 spec = S.normalize(spec, self.cfg["sizing"])
@@ -739,30 +904,38 @@ def _json_default(o):
 
 def snapshot_items(paths):
     """Yield (t, items) from recorded snapshot files (used by replay)."""
-    meta = {}  # token metadata carries across files, so rows near an hour boundary aren't dropped
-    for path in paths:
-        with gzip.open(path, "rt", encoding="utf8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                if "m" in rec:
-                    m = rec["m"]
-                    meta[(m.get("address") or "").lower()] = m
-                    continue
-                items = []
-                for row in rec.get("u", []):
-                    a = row[0]
-                    m = meta.get(a)
-                    if m is None:
-                        continue
-                    d = dict(m)
-                    (d["stage"], d["lastTradeAt"], d["raisedQuote"], d["priceQuote"], d["priceUsd"], d["marketCapUsd"],
-                     d["volumeUsd"], d["tradeCount"], d["progress"], d["quoteUsd"], d["graduatedAt"]) = row[1:12]
-                    d["address"] = a
-                    items.append(d)
-                yield rec["t"], items
+    def lines():
+        for path in paths:
+            with gzip.open(path, "rt", encoding="utf8") as fh:
+                yield from fh
+    yield from snapshot_records(lines())
+
+
+def snapshot_records(lines):
+    """Yield (t, items) from recorded snapshot lines. Token metadata carries across files, so rows near an hour
+    boundary aren't dropped."""
+    meta = {}
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if "m" in rec:
+            m = rec["m"]
+            meta[(m.get("address") or "").lower()] = m
+            continue
+        items = []
+        for row in rec.get("u", []):
+            a = row[0]
+            m = meta.get(a)
+            if m is None:
+                continue
+            d = dict(m)
+            (d["stage"], d["lastTradeAt"], d["raisedQuote"], d["priceQuote"], d["priceUsd"], d["marketCapUsd"],
+             d["volumeUsd"], d["tradeCount"], d["progress"], d["quoteUsd"], d["graduatedAt"]) = row[1:12]
+            d["address"] = a
+            items.append(d)
+        yield rec["t"], items

@@ -83,11 +83,29 @@ const EX_META = {
 const EVO_META = {
   population: ["Auto population", "#", "Number of auto strategies running at once"],
   epochMin: ["Epoch length", "min", "How often the worst auto strategies are retired and replaced"],
-  minTrades: ["Min trades to judge", "#", "Strategies with fewer closed trades are not culled for performance"],
+  minTrades: ["Min trades to judge", "#", "A strategy is judged once it has this many closed trades..."],
+  judgeAfterMin: ["...or after", "min", "...or once it has been alive this long with any trade or open position"],
+  stuckMin: ["Retire if stuck for", "min", "Retire an auto strategy that is losing overall and has held a position under water this long"],
   cullFrac: ["Cull fraction", "0-1", "Share of judged strategies retired each epoch (only losers unless the field is crowded)"],
   mutateFrac: ["Mutate fraction", "0-1", "Share of replacements bred from winners (the rest are random, for exploration)"],
   idleEpochs: ["Retire idle after", "epochs", "Auto strategies that never trade are replaced after this many epochs"],
   shrinkK: ["Score shrinkage", "trades", "Phantom zero-return trades added to the score; higher = more skeptical of small samples"],
+};
+const LAB_META = {
+  windowHours: ["Data window", "h", "How many hours of recorded data the lab trains and validates on"],
+  validateFrac: ["Validation share", "0-1", "Most recent share of the window held back for validation"],
+  population: ["Population", "#", "Genomes per generation"],
+  elite: ["Elites", "#", "Best genomes copied unchanged into the next generation"],
+  tournament: ["Tournament size", "#", "Parents are the best of this many random picks; larger = greedier"],
+  crossover: ["Crossover rate", "0-1", "Share of children made by mixing two parents (the rest are mutated copies)"],
+  mutation: ["Base mutation rate", "0-1", "Chance each gene changes; rises automatically when progress stalls"],
+  immigrants: ["Immigrants", "0-1", "Share of each generation that is brand-new random genomes"],
+  minTrades: ["Min trades (train)", "#", "Genomes with fewer training trades rank below every qualifying one"],
+  minValTrades: ["Min trades (validation)", "#", "Validation trades needed before a genome can be a champion"],
+  promoteCount: ["Champions per epoch", "#", "Validated genomes injected into live trading at each live epoch"],
+  rebuildMin: ["Refresh data every", "min", "How often the recorded window is reloaded"],
+  maxGensPerData: ["Generations per refresh", "#", "Pause after this many generations on the same data (more would only overfit it)"],
+  duty: ["CPU share", "0-1", "Fraction of one CPU the lab may use (keep low on small servers)"],
 };
 const POLL_META = {
   "poll.intervalSec": ["Poll interval", "s", "How often /api/launches?sort=active is fetched"],
@@ -104,7 +122,10 @@ function renderSettings() {
     chk("execution.useChainQuotes", "Fill on live on-chain quotes", "Off = fill from API data with the curve model (latency then has little effect)", c.execution.useChainQuotes);
   $("#sizeForm").innerHTML = Object.entries(S.meta.sizing).map(([k, d]) => fld("sizing." + k, [d.label, d.unit, d.help], c.sizing[k])).join("");
   $("#evoForm").innerHTML = chk("evolution.enabled", "Evolution on", "Retire losers and breed winners every epoch", c.evolution.enabled) +
-    Object.entries(EVO_META).map(([k, m]) => fld("evolution." + k, m, c.evolution[k])).join("");
+    Object.entries(EVO_META).map(([k, m]) => fld("evolution." + k, m, c.evolution[k])).join("") +
+    chk("evolution.retireClones", "Retire clones", "Retire auto strategies that make exactly the same trades as an older one", c.evolution.retireClones);
+  $("#labForm").innerHTML = chk("lab.enabled", "Lab on", "Run the genetic algorithm in the background on recorded data", c.lab.enabled) +
+    Object.entries(LAB_META).map(([k, m]) => fld("lab." + k, m, c.lab[k])).join("");
   $("#pollForm").innerHTML = Object.entries(POLL_META).map(([k, m]) => { const [a, b] = k.split("."); return fld(k, m, c[a][b]); }).join("") +
     chk("edge.enabled", "Edge map sampling", "Collect forward-return samples", c.edge.enabled) +
     chk("record.enabled", "Record snapshots", "Write every poll to data/snapshots for backtests", c.record.enabled);
@@ -116,7 +137,7 @@ $("#btnSaveSettings").onclick = async () => {
     const [a, b] = i.dataset.s.split(".");
     const v = i.type === "checkbox" ? i.checked : (i.value === "" ? null : Number(i.value));
     if (v === null) return;
-    (patch[a] ??= {})[b] = (a === "sizing" && b === "maxOpen") || ["population", "minTrades", "idleEpochs", "pages"].includes(b) ? Math.round(v) : v;
+    (patch[a] ??= {})[b] = (a === "sizing" && b === "maxOpen") || ["population", "minTrades", "idleEpochs", "pages", "elite", "tournament", "minValTrades", "promoteCount", "maxGensPerData"].includes(b) ? Math.round(v) : v;
   });
   await api("/api/settings", patch);
   await refresh(); renderSettings();

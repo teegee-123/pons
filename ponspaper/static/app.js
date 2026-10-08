@@ -268,6 +268,7 @@ async function refreshTab(force) {
   if (S.tab === "board") { if (S.sel && !S.editing) loadDetail(); }
   else if (S.tab === "market") renderMarket();
   else if (S.tab === "edge") renderEdge();
+  else if (S.tab === "lab") renderLab();
   else if (S.tab === "trades") renderTrades();
   else if (S.tab === "settings" && force) renderSettings();
   else if (S.tab === "backtest" && force) renderBacktest();

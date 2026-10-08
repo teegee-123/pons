@@ -28,11 +28,27 @@ after fees, impact and gas. A fresh position therefore starts around −4% to �
 
 ## Finding winning strategies
 
-- **Leaderboard:** 4 starter manual strategies plus 40 auto strategies, each with its own $1,000 bankroll. Every
-  20 minutes the evolver retires the worst auto strategies (and ones that never trade) and breeds replacements
-  from the best. Promote an auto strategy to keep it permanently.
-- **Score:** average net return per trade, shrunk toward 0 when there are few trades. This keeps lucky 1–2 trade
-  strategies from topping the board.
+- **Leaderboard:** 4 starter manual strategies plus 40 auto strategies, each with its own $1,000 bankroll.
+  Promote an auto strategy to keep it permanently.
+- **Score:** mark-to-market average net return per trade (open positions valued at what selling now would
+  return), shrunk toward 0 when there are few trades. This keeps lucky 1–2 trade strategies from topping the board.
+- **Live evolution (every 10 minutes):** auto strategies are retired when they are:
+  - **losing:** bottom 30% of those judged, and negative. A strategy is judged after 6 closed trades *or* 60 minutes
+    alive with any exposure.
+  - **stuck:** losing overall while holding a position that has been under water for 45+ minutes.
+  - **clones:** making exactly the same trades as an older strategy.
+  - **idle:** no trades for 30 minutes.
+
+  Replacements come from lab champions first, then mutations of the live winners, then random genomes.
+- **Genetic lab (background):** a full genetic algorithm that evolves genomes on the *recorded* market data
+  (last 12h by default). It uses tournament selection, crossover, per-gene mutation (the rate rises when progress
+  stalls), elitism, random immigrants and clone removal.
+  - **Fitness:** average net return per trade minus one standard error.
+  - **Validation:** the most recent 30% of the data is held back, and only genomes profitable on both parts become
+    champions. Champions are injected into live trading, which is the final out-of-sample test.
+  - **CPU:** limited to 30% of a CPU, and it pauses after 50 generations on the same data until the next refresh.
+  - **Locally:** `python -m ponspaper ga [recording.jsonl.gz]`.
+- **Time stop:** an exit gene the GA can evolve. It sells a position that has been under water for N minutes.
 - **Edge map:** strategy-independent. Every universe token is sampled as a hypothetical trade and valued after
   1/5/15/30 minutes. It shows which age, mcap, momentum, etc. buckets have positive expectancy after costs.
 - **Filters & settings:** the *trading universe* is the set of global filters (default: ETH-paired tokens, age

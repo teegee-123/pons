@@ -5,6 +5,7 @@
 """
 import argparse
 import glob
+import gzip
 import json
 import os
 import signal
@@ -88,10 +89,65 @@ def cmd_replay(a):
     out = {"at": time.time(), "files": files, "hours": span, "snapshots": n, "cfg": cfg,
            "rows": [dict(x, spec=eng.runs[x["id"]].spec) for x in rows[: max(a.top, 30)]],
            "hall": hall}
+    os.makedirs(a.data, exist_ok=True)
     path = os.path.join(a.data, "replay_results.json")
     with open(path, "w", encoding="utf8") as fh:
         json.dump(out, fh, default=str)
     print(f"\nresults written to {path} (visible in the dashboard's Backtest tab)")
+    return 0
+
+
+def cmd_ga(a):
+    """Run the genetic lab on recorded data and save champions for the Backtest tab."""
+    import random as _random
+    from .lab import DEFAULT_LAB, Lab
+    from .engine import SEEDS, snapshot_records
+    files = sorted(sum((glob.glob(p) for p in (a.files or [os.path.join(a.data, "snapshots", "*.jsonl.gz")])), []))
+    if not files:
+        print("no snapshot files found - run the live trader for a while, or download a recording from the dashboard")
+        return 1
+    cfg = deep_merge(DEFAULT_CONFIG, {"lab": DEFAULT_LAB})
+    try:
+        with open(os.path.join(a.data, "config.json"), encoding="utf8") as fh:
+            cfg = deep_merge(cfg, json.load(fh))
+    except (OSError, ValueError):
+        pass
+    cfg = deep_merge(cfg, {"lab": {"population": a.population}})
+    lab = Lab(cfg, _random.Random(a.seed))
+
+    def lines():
+        for path in files:
+            with gzip.open(path, "rt", encoding="utf8") as fh:
+                yield from fh
+    t0 = time.time()
+    print(f"loading {len(files)} file(s)...")
+    lab.build(snapshot_records(lines()))
+    ds = lab.ds
+    print(f"{ds.hours:.1f}h of data, {len(ds.cands)} entry candidates, {len(ds.tok_addr)} tokens ({time.time() - t0:.1f}s)")
+    lab.seed([S.normalize(dict(sd, kind="manual")) for sd in SEEDS])
+    for _ in range(a.generations):
+        lab.step()
+        h = lab.history[-1]
+        print(f"gen {h['gen']:3d}  best {h['best']:7.2f}  median {h['median'] if h['median'] is None else round(h['median'], 2)!s:>7}  "
+              f"distinct {h['unique']:3d}  mutation {h['mutation'] * 100:3.0f}%  champions {h['validated']}  ({lab.gen_secs:.1f}s)")
+    print("\nvalidated champions (train fitness | validation trades, avg):")
+    for c in lab.hall[: a.top]:
+        print(f"  {c['fitness']:6.2f} | {c['val']['n']:3d}, {c['val']['mean'] * 100:+6.2f}%  {S.describe(c['genome'])}")
+    if not lab.hall:
+        print("  none - nothing was profitable on both the training and the validation data")
+    rows = []
+    for c in lab.hall[: max(a.top, 20)]:
+        spec = S.normalize({"name": f"GA g{c['gen']}", "kind": "auto", **c["genome"]}, cfg["sizing"])
+        v = c["val"]
+        rows.append({"id": spec["id"], "name": spec["name"], "kind": "auto", "desc": S.describe(spec), "score": c["fitness"],
+                     "trades": v["n"], "winRate": v["win"], "pnl": v["pnl"], "maxDD": v["maxDD"], "spec": spec})
+    out = {"at": time.time(), "files": files, "hours": ds.hours, "snapshots": ds.rows, "cfg": cfg, "rows": rows,
+           "note": "genetic lab: score = training fitness, trades/win/P&L = validation data"}
+    os.makedirs(a.data, exist_ok=True)
+    path = os.path.join(a.data, "replay_results.json")
+    with open(path, "w", encoding="utf8") as fh:
+        json.dump(out, fh, default=str)
+    print(f"\nchampions written to {path} (Backtest tab -> Adopt)")
     return 0
 
 
@@ -111,9 +167,17 @@ def main(argv=None):
     b.add_argument("--latency-ms", type=float, default=None)
     b.add_argument("--top", type=int, default=25)
     b.add_argument("--seed", type=int, default=None)
+    g = sub.add_parser("ga", help="run the genetic lab on recorded snapshots")
+    g.add_argument("files", nargs="*", help="snapshot .jsonl.gz files (default: all in data/snapshots)")
+    g.add_argument("--generations", type=int, default=30)
+    g.add_argument("--population", type=int, default=80)
+    g.add_argument("--top", type=int, default=10)
+    g.add_argument("--seed", type=int, default=None)
     a = p.parse_args(argv)
     if a.cmd == "replay":
         return cmd_replay(a)
+    if a.cmd == "ga":
+        return cmd_ga(a)
     if a.cmd is None:
         a = p.parse_args(["--data", a.data, "run"])
     return cmd_run(a)

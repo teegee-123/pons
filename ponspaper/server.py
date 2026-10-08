@@ -65,6 +65,8 @@ def make_handler(engine):
                 return self._send(200, engine.store.snapshots_gz(), "application/gzip", "pons_snapshots.jsonl.gz")
             if p == "/api/meta":
                 return self._send(200, engine.meta())
+            if p == "/api/lab":
+                return self._send(200, engine.lab_view())
             if p == "/api/market":
                 return self._send(200, engine.market_view())
             if p == "/api/trades":
@@ -107,6 +109,12 @@ def make_handler(engine):
                 sid = p.split("/")[3]
                 res = engine.strategy_action(sid, b.get("action"))
                 return self._send(200 if res else 404, res or {"error": "not found"})
+            if p == "/api/lab/deploy":
+                added = engine.lab_deploy(b.get("key"))
+                return self._send(200, {"added": added})
+            if p == "/api/lab/rebuild":
+                engine.lab_rebuild()
+                return self._send(200, {"ok": True})
             if p == "/api/evolve":
                 engine.evolve()
                 return self._send(200, {"ok": True})
