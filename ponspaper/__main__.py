@@ -134,7 +134,7 @@ def cmd_ga(a):
     for c in lab.hall[: a.top]:
         print(f"  {c['fitness']:6.2f} | {c['val']['n']:3d}, {c['val']['mean'] * 100:+6.2f}%  {S.describe(c['genome'])}")
     if not lab.hall:
-        print("  none - nothing was profitable on both the training and the validation data")
+        print("  none - nothing passed all three exams (training slices, validation, stress test)")
     rows = []
     for c in lab.hall[: max(a.top, 20)]:
         spec = S.normalize({"name": f"GA g{c['gen']}", "kind": "auto", **c["genome"]}, cfg["sizing"])

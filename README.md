@@ -43,9 +43,19 @@ after fees, impact and gas. A fresh position therefore starts around âˆ’4% to âˆ
 - **Genetic lab (background):** a full genetic algorithm that evolves genomes on the *recorded* market data
   (last 12h by default). It uses tournament selection, crossover, per-gene mutation (the rate rises when progress
   stalls), elitism, random immigrants and clone removal.
-  - **Fitness:** average net return per trade minus one standard error.
-  - **Validation:** the most recent 30% of the data is held back, and only genomes profitable on both parts become
-    champions. Champions are injected into live trading, which is the final out-of-sample test.
+  - **Fitness:** average net return per trade minus one standard error, minus penalties for each filter, for
+    unprofitable training slices and for drawdown beyond 10%, plus a small bonus for trading often when profitable.
+  - **Diversity:** genomes that trade mostly the same tokens as others are marked down for breeding, so different
+    ideas stay alive. Elites are chosen so no two make mostly the same trades.
+  - **Champions** must pass three exams:
+    - profitable in most of the 4 training slices;
+    - profitable on the held-back most recent 30% of the data, with 15+ trades;
+    - still profitable under a stress test (+750 ms latency, +0.5% fees).
+
+    They are re-checked on every data refresh and dropped if they stop passing.
+  - **Live feedback:** champions are injected into live trading, the final out-of-sample test.
+    - One that fails live is blacklisted, and its close relatives are marked down.
+    - Live winners are fed back into the lab population.
   - **CPU:** limited to 30% of a CPU, and it pauses after 50 generations on the same data until the next refresh.
   - **Locally:** `python -m ponspaper ga [recording.jsonl.gz]`.
 - **Time stop:** an exit gene the GA can evolve. It sells a position that has been under water for N minutes.

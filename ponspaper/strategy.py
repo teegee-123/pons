@@ -272,11 +272,25 @@ def genome(spec):
     return _finish({"filters": copy.deepcopy(spec.get("filters", {})), "exits": copy.deepcopy(spec.get("exits", {}))})
 
 
+def _canon(v):
+    """Numbers compare by value (40 == 40.0), so lab genomes and live specs get the same key."""
+    if isinstance(v, bool) or v is None or isinstance(v, str):
+        return v
+    if isinstance(v, (int, float)):
+        v = round(float(v), 6)
+        return int(v) if v.is_integer() else v
+    if isinstance(v, (list, tuple)):
+        return [_canon(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _canon(x) for k, x in v.items() if x is not None}
+    return v
+
+
 def genome_key(g):
     """Canonical text for a genome, so identical rule sets are recognised as duplicates."""
-    f = {k: v for k, v in sorted((g.get("filters") or {}).items()) if v and any(x is not None for x in v.values())}
-    ex = {k: v for k, v in sorted((g.get("exits") or {}).items()) if v is not None}
-    return json.dumps({"f": f, "x": ex}, sort_keys=True)
+    f = {k: _canon(v) for k, v in sorted((g.get("filters") or {}).items()) if v and any(x is not None for x in v.values())}
+    ex = {k: _canon(v) for k, v in sorted((g.get("exits") or {}).items()) if v is not None}
+    return json.dumps({"f": {k: v for k, v in f.items() if v}, "x": ex}, sort_keys=True)
 
 
 def crossover(a, b, rng=random):

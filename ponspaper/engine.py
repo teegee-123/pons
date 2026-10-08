@@ -21,7 +21,7 @@ from .sim import Portfolio, Position, liquidation_usd, model_venue
 from .store import open_store
 from .lab import DEFAULT_LAB, Lab
 
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 DEFAULT_CONFIG = {
     "configVersion": CONFIG_VERSION,
@@ -134,6 +134,9 @@ class Engine:
             self.cfg = deep_merge(DEFAULT_CONFIG, saved)
             if saved and saved.get("configVersion", 1) < 2:  # v2: faster live epochs to go with stuck/clone retirement
                 self.cfg["evolution"]["epochMin"] = DEFAULT_CONFIG["evolution"]["epochMin"]
+            if saved and saved.get("configVersion", 1) < 3:  # v3: a champion needs far more validation trades
+                self.cfg["lab"]["minValTrades"] = max(self.cfg["lab"].get("minValTrades", 0),
+                                                      DEFAULT_CONFIG["lab"]["minValTrades"])
             self.cfg["configVersion"] = CONFIG_VERSION
         self.market = Market()
         self.runs = {}
@@ -265,10 +268,14 @@ class Engine:
                     since = time.time() - lc["windowHours"] * 3600
                     lab.build(snapshot_records(self.store.snapshot_lines(since)), yield_every=(1.0 - duty) / duty * 0.25)
                     lab.last_error = None
+                    with self.lock:
+                        k = self.cfg["evolution"]["shrinkK"]
+                        winners = [r.spec for r in self.runs.values()
+                                   if r.pf.stats["n"] >= self.cfg["evolution"]["minTrades"] and r.score(k) > 0]
+                        seeds = [r.spec for r in self.runs.values()] + [h["spec"] for h in self.hall if h.get("spec")]
                     if not lab.pop:
-                        with self.lock:
-                            seeds = [r.spec for r in self.runs.values()] + [h["spec"] for h in self.hall if h.get("spec")]
                         lab.seed(seeds)
+                    lab.inject(winners)  # live winners compete in the lab too
                 if lab.gens_on_data >= lc.get("maxGensPerData", 50):
                     # more generations on the same data only overfit it: wait for the next refresh
                     lab.phase = "waiting for new data"
@@ -618,6 +625,12 @@ class Engine:
                     retire.setdefault(r.spec["id"], (r, "never traded"))
             # never wipe out more than half the population in one epoch
             victims = sorted(retire.values(), key=lambda x: x[0].score(k))[: max(1, len(autos) // 2)]
+            if self.lab is not None:
+                judged_ids = {r.spec["id"] for r in judged}
+                for r in autos:
+                    if r.spec.get("origin") == "lab" and r.spec["id"] in judged_ids:
+                        self.lab.record_live(r.spec, "winning" if r.score(k) > 0 else "losing", r.score(k),
+                                             r.pf.stats["n"], r.mtm_pnl())
             for r in judged:
                 self._hall_update(r, k, now)
             parents = judged[-max(1, len(judged) // 4):] if judged else []
@@ -632,6 +645,8 @@ class Engine:
 
     def _retire(self, r, why, now):
         k = self.cfg["evolution"]["shrinkK"]
+        if self.lab is not None and r.spec.get("origin") == "lab":
+            self.lab.record_live(r.spec, "failed", r.score(k), r.pf.stats["n"], r.mtm_pnl(), why)
         self.retired.appendleft({"id": r.spec["id"], "name": r.spec["name"], "desc": S.describe(r.spec),
                                  "gen": r.spec.get("gen", 0), "score": r.score(k), "summary": r.pf.summary(),
                                  "at": now, "why": why})

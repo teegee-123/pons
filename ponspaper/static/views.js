@@ -105,6 +105,18 @@ const LAB_META = {
   promoteCount: ["Champions per epoch", "#", "Validated genomes injected into live trading at each live epoch"],
   rebuildMin: ["Refresh data every", "min", "How often the recorded window is reloaded"],
   maxGensPerData: ["Generations per refresh", "#", "Pause after this many generations on the same data (more would only overfit it)"],
+  folds: ["Training slices", "#", "The training data is cut into this many consecutive slices; genomes are rewarded for profiting in most of them"],
+  minFoldShare: ["Champion: slices profitable", "0-1", "Share of training slices a champion must be profitable in"],
+  stressLatencyMs: ["Stress: extra latency", "ms", "Champions must stay profitable with this much extra delay..."],
+  stressFeeBps: ["Stress: extra fees", "bps", "...and this much extra cost per trade side"],
+  complexityPenalty: ["Simplicity penalty", "per filter", "Fitness points removed per active filter; simpler rules generalise better"],
+  consistencyPenalty: ["Consistency penalty", "points", "Removed in proportion to the training slices that weren't profitable"],
+  ddPenalty: ["Drawdown penalty", "per %", "Points removed per % of drawdown beyond 10% of bankroll"],
+  activityBonus: ["Activity bonus", "points", "Bonus for trading more often, only when profitable"],
+  nicheSimilarity: ["Similarity threshold", "0-1", "Two genomes sharing this share of their trades count as the same idea"],
+  nichePenalty: ["Diversity penalty", "per twin", "Breeding fitness removed per similar genome, to keep different ideas alive"],
+  feedbackPenalty: ["Live failure penalty", "points", "Breeding fitness removed from close relatives of champions that failed live"],
+  feedbackBonus: ["Live winner bonus", "points", "Breeding fitness added to close relatives of champions winning live"],
   duty: ["CPU share", "0-1", "Fraction of one CPU the lab may use (keep low on small servers)"],
 };
 const POLL_META = {
@@ -137,7 +149,7 @@ $("#btnSaveSettings").onclick = async () => {
     const [a, b] = i.dataset.s.split(".");
     const v = i.type === "checkbox" ? i.checked : (i.value === "" ? null : Number(i.value));
     if (v === null) return;
-    (patch[a] ??= {})[b] = (a === "sizing" && b === "maxOpen") || ["population", "minTrades", "idleEpochs", "pages", "elite", "tournament", "minValTrades", "promoteCount", "maxGensPerData"].includes(b) ? Math.round(v) : v;
+    (patch[a] ??= {})[b] = (a === "sizing" && b === "maxOpen") || ["population", "minTrades", "idleEpochs", "pages", "elite", "tournament", "minValTrades", "promoteCount", "maxGensPerData", "folds", "stressLatencyMs", "stressFeeBps"].includes(b) ? Math.round(v) : v;
   });
   await api("/api/settings", patch);
   await refresh(); renderSettings();
