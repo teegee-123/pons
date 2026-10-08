@@ -721,6 +721,7 @@ class Engine:
             st = dict(self.status)
             st.update(tokens=len(self.market.tokens), pendingOrders=self.executor.pending(),
                       storage=self.store.kind if self.store else None,
+                      memMB=memory_mb()[0], memPeakMB=memory_mb()[1],
                       storageError=getattr(self.store, "last_error", None),
                       executorError=self.executor.last_error,
                       chainCalls=self.chain.calls if self.chain else 0, chainFailures=self.chain.failures if self.chain else 0,
@@ -894,6 +895,16 @@ class Engine:
             self.last_epoch = time.time()
             if reseed:
                 self._seed()
+
+
+def memory_mb():
+    """(current, peak) resident memory in MB on Linux hosts like Render; (None, None) elsewhere."""
+    try:
+        with open("/proc/self/status") as fh:
+            vals = {line.split(":")[0]: line.split()[1] for line in fh if line.startswith(("VmRSS", "VmHWM"))}
+        return round(int(vals["VmRSS"]) / 1024), round(int(vals["VmHWM"]) / 1024)
+    except (OSError, KeyError, ValueError):
+        return None, None
 
 
 def _json_default(o):

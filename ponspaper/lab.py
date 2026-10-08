@@ -237,7 +237,7 @@ class Evaluator:
         ei = bisect.bisect_right(times, t_exit + self.lat) - 1 if reason != "end of data" else k
         proceeds = _sell_usd(pts[ei], tokens) - self.gas
         r = (t_exit + (self.lat if reason != "end of data" else 0.0), cost, proceeds, reason)
-        if len(self.memo) > 400000:
+        if len(self.memo) > 120000:  # keep memory bounded on small servers
             self.memo.clear()
         self.memo[mk] = r
         return r
