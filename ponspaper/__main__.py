@@ -72,8 +72,8 @@ def cmd_replay(a):
             eng.upsert_strategy({k: v for k, v in sp.items() if k != "id"})
     t0, n, first, last = time.time(), 0, None, None
     print(f"replaying {len(files)} file(s) with {len(eng.runs)} strategies...")
-    for t, items in snapshot_items(files):
-        eng.tick(items, t)
+    for t, items, ticks, gap in snapshot_items(files):
+        eng.tick(items, t, tick_rows=ticks, tick_gap=gap)
         first = first or t
         last = t
         n += 1
@@ -121,7 +121,11 @@ def cmd_ga(a):
                 yield from fh
     t0 = time.time()
     print(f"loading {len(files)} file(s)...")
-    lab.build(snapshot_records(lines()))
+    try:
+        lab.build(snapshot_records(lines()))
+    except ValueError as e:
+        print(e)
+        return 1
     ds = lab.ds
     print(f"{ds.hours:.1f}h of data, {len(ds.cands)} entry candidates, {len(ds.tok_addr)} tokens ({time.time() - t0:.1f}s)")
     lab.seed([S.normalize(dict(sd, kind="manual")) for sd in SEEDS])

@@ -9,10 +9,13 @@ async function renderMarket() {
   $("#mktSub").textContent = `${toks.length} shown, most recently traded first`;
   const chg = x => `<td class="n ${cls(x)}">${fP(x, 1)}</td>`;
   $("#mktTbl").innerHTML = `<tr><th>Token</th><th>Stage</th><th class="n">Age</th><th class="n">Mcap</th><th class="n">Progress</th><th class="n">1m</th><th class="n">5m</th><th class="n">15m</th>
-    <th class="n">Trades/min</th><th class="n">Vol/min</th><th class="n">Below peak</th><th class="n">Trades</th><th class="n">Tax</th><th class="n">Socials</th><th class="n">Idle</th><th>Universe</th><th class="n">Held by</th></tr>` +
+    <th class="n">Trades/min</th><th class="n">Vol/min</th><th class="n" title="tick data">Buy share</th><th class="n" title="tick data">Net flow</th><th class="n" title="tick data">Buyers 5m</th><th class="n" title="tick data">Biggest buy</th><th class="n" title="tick data">Spike</th><th class="n" title="tick data">Creator sold</th><th class="n">Below peak</th><th class="n">Trades</th><th class="n">Tax</th><th class="n">Socials</th><th class="n">Idle</th><th>Universe</th><th class="n">Held by</th></tr>` +
     toks.map(t => `<tr><td><a href="https://robin.etherscan.io/token/${t.addr}" target="_blank" rel="noopener"><b>${esc(t.sym)}</b></a> <span class="dim">${esc((t.name || "").slice(0, 22))}</span>${t.quote !== "ETH" ? ` <span class="tag">${esc(t.quote)}</span>` : ""}</td>
       <td>${esc(t.stage)}</td><td class="n">${fMin(t.ageMin)}</td><td class="n">${fK(t.mcapUsd)}</td><td class="n">${t.progressPct == null ? "–" : fNum(t.progressPct, 0) + "%"}</td>
       ${chg(t.chg1m)}${chg(t.chg5m)}${chg(t.chg15m)}<td class="n">${t.tpm1 == null ? "–" : fNum(t.tpm1, 1)}</td><td class="n">${t.vol1m == null ? "–" : fUsd(t.vol1m, 0)}</td>
+      <td class="n">${t.buyRatio1m == null ? "–" : fNum(t.buyRatio1m, 0) + "%"}</td><td class="n ${cls(t.netFlow1m)}">${t.netFlow1m == null ? "–" : fSUsd(t.netFlow1m, 0)}</td>
+      <td class="n">${t.buyers5m ?? "–"}</td><td class="n">${t.whale1m == null ? "–" : fUsd(t.whale1m, 0)}</td>
+      <td class="n">${t.volSpike == null ? "–" : fNum(t.volSpike, 1) + "×"}</td><td class="n ${t.devSoldUsd > 0 ? "neg" : ""}">${t.devSoldUsd == null ? "–" : fUsd(t.devSoldUsd, 0)}</td>
       <td class="n">${t.ddPeak == null ? "–" : fNum(t.ddPeak, 0) + "%"}</td><td class="n">${fNum(t.tradeCount, 0)}</td><td class="n">${t.taxBps}</td><td class="n">${t.socials}</td>
       <td class="n">${fDur(t.idleSec)}</td><td>${t.inUniverse ? "✓ yes" : '<span class="dim">no</span>'}</td><td class="n">${t.held || ""}</td></tr>`).join("");
 }

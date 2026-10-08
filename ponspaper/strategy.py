@@ -21,6 +21,13 @@ FILTERS = {
     "idleSec":     ("Idle", "s", "range", "Seconds since the last trade"),
     "taxBps":      ("Creator tax", "bps", "range", "Creator tax charged on every buy and sell (100 bps = 1%)"),
     "socials":     ("Socials", "#", "range", "Number of social links set (twitter, telegram, website, ...)"),
+    "buyRatio1m":  ("Buy share 1m", "%", "range", "Share of the last minute's on-chain volume that was buys (tick data)"),
+    "netFlow1m":   ("Net flow 1m", "$", "range", "Buy minus sell volume in the last minute, USD (tick data)"),
+    "buyers5m":    ("Buyers 5m", "#", "range", "Distinct wallets that bought in the last 5 minutes (tick data)"),
+    "sellers5m":   ("Sellers 5m", "#", "range", "Distinct wallets that sold in the last 5 minutes (tick data)"),
+    "whale1m":     ("Biggest buy 1m", "$", "range", "Largest single buy in the last minute, USD (tick data)"),
+    "volSpike":    ("Volume spike", "x", "range", "Last minute's volume vs the average minute over the last 15 (tick data)"),
+    "devSoldUsd":  ("Creator sold", "$", "range", "USD the token's creator has sold since we started watching (tick data)"),
     "stage":       ("Stage", "", "enum", "curve = still on the bonding curve, graduated = trading in the v4 pool"),
     "quote":       ("Quote asset", "", "enum", "ETH-paired or paired with another token"),
     "buyback":     ("Buyback", "", "enum", "Buyback-and-burn enabled"),
@@ -144,6 +151,13 @@ SPACE = [
     ("filters.taxBps.max",      [0, 100, 200, 300], 0.2),
     ("filters.socials.min",     [1, 2], 0.2),
     ("filters.stage.in",        [["curve"], ["graduated"]], 0.3),
+    ("filters.buyRatio1m.min",  [40, 50, 60, 70, 80, 90], 0.3),
+    ("filters.netFlow1m.min",   [-100, 0, 50, 150, 400, 1000], 0.3),
+    ("filters.buyers5m.min",    [2, 3, 5, 8, 12, 20, 35], 0.3),
+    ("filters.sellers5m.max",   [0, 1, 2, 4, 8, 15], 0.2),
+    ("filters.whale1m.min",     [50, 100, 200, 400, 800], 0.2),
+    ("filters.volSpike.min",    [1.5, 2, 3, 5, 8], 0.25),
+    ("filters.devSoldUsd.max",  [0, 10, 50], 0.25),
     ("exits.tpPct",             [10, 15, 20, 30, 40, 50, 75, 100, 150, 250], 1.0),
     ("exits.slPct",             [8, 12, 15, 20, 25, 30, 40, 60], 0.9),
     ("exits.trailPct",          [8, 12, 15, 20, 30, 40], 0.5),
@@ -250,7 +264,9 @@ def describe(spec):
                                     ("tpm1", "tpm", "", 1), ("vol1m", "v1m", "$", 1), ("chg1m", "1m", "%", 1),
                                     ("chg5m", "5m", "%", 1), ("chg15m", "15m", "%", 1), ("ddPeak", "dd", "%", 1),
                                     ("tradeCount", "trades", "", 1), ("idleSec", "idle", "s", 1), ("taxBps", "tax", "bps", 1),
-                                    ("socials", "soc", "", 1)):
+                                    ("socials", "soc", "", 1), ("buyRatio1m", "buy%", "%", 1), ("netFlow1m", "flow", "$", 1),
+                                    ("buyers5m", "buyers", "", 1), ("sellers5m", "sellers", "", 1), ("whale1m", "whale", "$", 1),
+                                    ("volSpike", "spike", "x", 1), ("devSoldUsd", "devsold", "$", 1)):
         t = rng_txt(key, unit, scale)
         if t:
             parts.append(f"{label} {t}")

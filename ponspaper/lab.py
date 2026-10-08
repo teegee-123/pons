@@ -61,12 +61,15 @@ class Dataset:
         idx, last_c = {}, {}
         mk = Market()
         t_yield = time.time()
-        for t, items in records:
+        self.tick_rows = 0
+        for t, items, ticks, tick_gap in records:
+            prev = self.t1
             if self.t0 is None:
                 self.t0 = t
             elif t - self.t1 < 120:
                 self.covered += t - self.t1
             self.t1 = t
+            pending = []
             for d in items:
                 a = d["address"]
                 self.rows += 1
@@ -93,6 +96,18 @@ class Dataset:
                     continue
                 if not changed and t - last_c.get(i, 0) < sample_every:
                     continue
+                pending.append((tok, i))
+            # trades are applied before features, exactly like the live engine; a recording gap restarts windows
+            if ticks is not None:
+                if mk.tick_start is None or tick_gap or (prev is not None and t - prev > 60):
+                    mk.start_ticks(t)
+                mk.add_tick_rows(ticks, t)
+                self.tick_rows += len(ticks)
+            elif mk.tick_start is not None and prev is not None and t - prev > 60:
+                mk.tick_start = None  # feed wasn't recorded: tick signals unknown until it resumes
+                for tk in mk.tokens.values():
+                    tk.tick_since = math.inf
+            for tok, i in pending:
                 f = tok.features(t)
                 if not S.passes(universe, f):
                     continue

@@ -26,6 +26,28 @@ Windows PAC script. Set `PONS_PROXY=host:port` to override.
 Exits (take profit, stop loss, trailing stop) are measured on **net** return: what selling right now would pay
 after fees, impact and gas. A fresh position therefore starts around −4% to −8%.
 
+## Tick data (on-chain trades)
+
+Every poll also reads every individual pons bonding-curve buy and sell from Robinhood Chain event logs: one
+extra request, trades arrive a few seconds after they happen. They power seven extra signals, which are
+available as filters, GA genes, edge-map rows and Market-tab columns:
+
+| Signal | Meaning |
+|---|---|
+| Buy share 1m | % of the last minute's volume that was buys |
+| Net flow 1m | buy minus sell USD in the last minute |
+| Buyers 5m / Sellers 5m | distinct wallets buying / selling in the last 5 minutes |
+| Biggest buy 1m | largest single buy in the last minute |
+| Volume spike | last minute's volume vs the average minute of the last 15 |
+| Creator sold | USD the token's creator has sold since we started watching |
+
+A signal stays empty until its whole window has been watched; after a feed gap or restart, the windows start
+again. Trades are recorded with the snapshots, so the genetic lab and replays use the same signals.
+
+Limitations:
+- Graduated tokens (Uniswap v4 pools) aren't covered yet.
+- "Creator sold" only counts sales made while the trader was watching.
+
 ## Finding winning strategies
 
 - **Leaderboard:** 4 starter manual strategies plus 40 auto strategies, each with its own $1,000 bankroll.

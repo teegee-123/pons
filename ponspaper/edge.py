@@ -23,6 +23,12 @@ BUCKETS = {
     "idleSec":     [10, 30, 90, 300],
     "taxBps":      [1, 101, 201, 301],
     "socials":     [1, 2, 3],
+    "buyRatio1m":  [30, 50, 70, 90],
+    "netFlow1m":   [-200, 0, 100, 500],
+    "buyers5m":    [2, 5, 10, 20],
+    "whale1m":     [1, 100, 300, 1000],
+    "volSpike":    [1, 2, 4, 8],
+    "devSoldUsd":  [1, 50],
 }
 GRID = ("ageMin", "mcapUsd")
 

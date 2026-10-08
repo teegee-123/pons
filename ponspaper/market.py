@@ -1,11 +1,14 @@
 """Token state + rolling history, and the features strategies filter on."""
 import bisect
 import math
+from collections import deque
 
 TOKEN_SUPPLY = 1e9
 CURVE_V0_RATIO = 0.4   # virtual quote reserve at launch = 0.4 x graduation threshold (on-chain: 1.68 ETH vs 4.2 ETH)
 HIST_SEC = 1800        # keep 30 minutes of samples per token
 SAMPLE_EVERY = 15      # add a sample at least this often even if nothing changed
+TICK_SEC = 900         # keep 15 minutes of individual trades per token
+TICK_KEYS = ("buyRatio1m", "netFlow1m", "buyers5m", "sellers5m", "whale1m", "volSpike", "devSoldUsd")
 
 
 def curve_params(threshold):
@@ -44,7 +47,8 @@ def spot_usd(d):
 
 
 class Token:
-    __slots__ = ("addr", "d", "first_seen", "updated", "hist", "_t", "_peak", "_peak_t")
+    __slots__ = ("addr", "d", "first_seen", "updated", "hist", "_t", "_peak", "_peak_t",
+                 "ticks", "tick_since", "dev_sold", "dev")
 
     def __init__(self, addr, d, now):
         self.addr = addr
@@ -54,6 +58,10 @@ class Token:
         self.hist = []   # (t, spot_usd, volume_usd, trade_count)
         self._t = []     # parallel list of t for bisect
         self._peak, self._peak_t = 0.0, 0.0  # running max of spot over the history window
+        self.ticks = deque()                   # (t, side, usd, wallet)
+        self.tick_since = math.inf             # trades are known completely from this time on
+        self.dev_sold = 0.0                    # USD the creator has sold (since we started watching)
+        self.dev = (d.get("deployer") or "").lower()[2:18]
         created = d.get("createdAt") or now
         thr = d.get("thresholdQuote") or 0
         if d.get("stage") != "graduated" and thr > 0 and now - created < HIST_SEC and d.get("quoteUsd"):
@@ -96,6 +104,56 @@ class Token:
                     self._peak, self._peak_t = self.hist[j][1], self.hist[j][0]
         return changed
 
+    def add_tick(self, t, side, usd, wallet, is_dev=False):
+        self.ticks.append((t, side, usd, wallet))
+        if is_dev and side < 0:
+            self.dev_sold += usd
+        cut = t - TICK_SEC
+        while self.ticks and self.ticks[0][0] < cut:
+            self.ticks.popleft()
+
+    def tick_features(self, now):
+        """Signals from individual trades. A window only reports once trades have been watched for its whole
+        length (or since the token was created), so a value is never a partial guess."""
+        out = dict.fromkeys(TICK_KEYS)
+        known = self.tick_since
+        if known == math.inf:
+            return out
+        created = self.d.get("createdAt") or 0
+        born_watched = created >= known - 5
+
+        def valid(w):
+            return born_watched or now - w >= known
+
+        b60 = s60 = whale = vol60 = vol900 = 0.0
+        buyers, sellers = set(), set()
+        for t, side, usd, wallet in reversed(self.ticks):
+            age = now - t
+            if age > TICK_SEC:
+                break
+            vol900 += usd
+            if age <= 60:
+                vol60 += usd
+                if side > 0:
+                    b60 += usd
+                    whale = max(whale, usd)
+                else:
+                    s60 += usd
+            if age <= 300 and wallet:
+                (buyers if side > 0 else sellers).add(wallet)
+        if valid(60):
+            out["buyRatio1m"] = 100.0 * b60 / (b60 + s60) if b60 + s60 > 0 else None
+            out["netFlow1m"] = b60 - s60
+            out["whale1m"] = whale
+        if valid(300):
+            out["buyers5m"] = len(buyers)
+            out["sellers5m"] = len(sellers)
+        span = min(TICK_SEC, now - max(known, created))
+        if span >= 120 and vol900 > 0:
+            out["volSpike"] = vol60 / (vol900 / (span / 60.0))
+        out["devSoldUsd"] = self.dev_sold
+        return out
+
     def at(self, t):
         """Last sample at or before t, or None if history doesn't reach back that far."""
         i = bisect.bisect_right(self._t, t)
@@ -136,12 +194,16 @@ class Token:
             f["ddPeak"] = max(0.0, (1.0 - px / peak) * 100.0) if peak > 0 else None
         else:
             f["ddPeak"] = None
+        f.update(self.tick_features(now))
         return f
 
 
 class Market:
     def __init__(self):
         self.tokens = {}
+        self.by_curve = {}      # curve contract -> token address
+        self.tick_start = None  # when the trade feed started (or last restarted after a gap)
+        self._pending = deque()  # trades for curves we haven't seen in the launch list yet
 
     def ingest(self, items, now):
         seen = []
@@ -152,10 +214,56 @@ class Market:
             t = self.tokens.get(addr)
             if t is None:
                 t = self.tokens[addr] = Token(addr, d, now)
+                if self.tick_start is not None:
+                    t.tick_since = max(self.tick_start, d.get("createdAt") or 0)
             else:
                 t.update(d, now)
+            if d.get("curve"):
+                self.by_curve[d["curve"].lower()] = addr
             seen.append(t)
         return seen
+
+    def start_ticks(self, now):
+        """The trade feed is (re)starting: windows are only complete from now on."""
+        self.tick_start = now
+        for t in self.tokens.values():
+            t.tick_since = max(now, t.d.get("createdAt") or 0)
+
+    def add_ticks(self, raw, now):
+        """raw: decoded log ticks (curve, t, side, quote_raw, wallet). Returns the resolved trades as
+        [token, t, side, usd, wallet, is_dev] rows (also used for recording)."""
+        if self.tick_start is None:
+            self.start_ticks(now)
+        rows = []
+        queue = list(self._pending) + [(now, r) for r in raw]
+        self._pending.clear()
+        for seen_at, r in queue:
+            addr = self.by_curve.get(r["curve"])
+            tok = self.tokens.get(addr) if addr else None
+            if tok is None:
+                if now - seen_at < 120:
+                    self._pending.append((seen_at, r))
+                continue
+            d = tok.d
+            qu = d.get("quoteUsd")
+            if not qu:
+                continue
+            dec = (d.get("quote") or {}).get("decimals", 18)
+            usd = r["quote_raw"] / 10 ** dec * qu
+            is_dev = bool(tok.dev and r["wallet"] and r["wallet"] == tok.dev)
+            t = r["t"] or now
+            tok.add_tick(t, r["side"], usd, r["wallet"], is_dev)
+            rows.append([addr, t, r["side"], round(usd, 2), r["wallet"], 1 if is_dev else 0])
+        return rows
+
+    def add_tick_rows(self, rows, now):
+        """Replay path: rows already resolved to [token, t, side, usd, wallet, is_dev]."""
+        if self.tick_start is None:
+            self.start_ticks(now)
+        for addr, t, side, usd, wallet, is_dev in rows:
+            tok = self.tokens.get(addr)
+            if tok is not None:
+                tok.add_tick(t, side, usd, wallet, bool(is_dev))
 
     def get(self, addr):
         return self.tokens.get(addr)

@@ -19,6 +19,7 @@ from .market import Market, socials_count, spot_usd
 from .net import Client, HttpError
 from .sim import Portfolio, Position, liquidation_usd, model_venue
 from .store import open_store
+from .ticks import TickFeed
 from .lab import DEFAULT_LAB, Lab
 
 CONFIG_VERSION = 3
@@ -46,6 +47,7 @@ DEFAULT_CONFIG = {
     "lab": DEFAULT_LAB,
     "edge": {"enabled": True, "sampleEverySec": 120, "horizonsMin": [1, 5, 15, 30], "sizeUsd": 50.0},
     "record": {"enabled": True},
+    "ticks": {"enabled": True},
 }
 
 SEEDS = [
@@ -61,7 +63,8 @@ SEEDS = [
 
 TRADE_FEAT_COLS = ["ageMin", "mcapUsd", "progressPct", "chg1m", "chg5m", "tpm1", "vol1m", "ddPeak", "taxBps", "socials"]
 FEAT_KEEP = ["ageMin", "mcapUsd", "progressPct", "chg1m", "chg5m", "chg15m", "tpm1", "vol1m", "ddPeak", "tradeCount",
-             "idleSec", "taxBps", "socials", "stage"]
+             "idleSec", "taxBps", "socials", "stage", "buyRatio1m", "netFlow1m", "buyers5m", "sellers5m", "whale1m",
+             "volSpike", "devSoldUsd"]
 
 
 def deep_merge(base, patch):
@@ -148,9 +151,11 @@ class Engine:
         self.last_epoch = time.time()
         self.edge = EdgeMap(self.cfg["edge"], data_dir if live else None)
         self.status = {"startedAt": time.time(), "polls": 0, "pollErrors": 0, "lastPollAt": None, "lastPollMs": None,
-                       "lastError": None, "gaps": 0, "refreshes": 0, "ethUsd": None, "lastEquitySample": 0}
+                       "lastError": None, "gaps": 0, "refreshes": 0, "ethUsd": None, "lastEquitySample": 0,
+                       "tickErrors": 0, "tickGaps": 0, "tickLastError": None, "tickCount": 0}
         self.client = Client() if live else None
         self.chain = Chain(self.client, self.cfg["rpcUrl"], self.cfg["apiBase"]) if live else None
+        self.tickfeed = TickFeed(self.client, self.cfg["rpcUrl"], self.cfg["apiBase"]) if live else None
         self.executor = LiveExecutor(self) if live else ReplayExecutor(self)
         self._prev_newest_trade = None
         self._dirty = set()
@@ -302,8 +307,8 @@ class Engine:
         while not self.stopping.is_set():
             t0 = time.time()
             try:
-                items, listed = self._poll()
-                self.tick(items, time.time(), listed)
+                items, listed, tick_res = self._poll()
+                self.tick(items, time.time(), listed, live_ticks=tick_res)
                 self.status["polls"] += 1
                 self.status["lastPollAt"] = time.time()
                 self.status["lastPollMs"] = round((time.time() - t0) * 1000)
@@ -318,6 +323,7 @@ class Engine:
     def _poll(self):
         base = self.cfg["apiBase"].rstrip("/")
         pc = self.cfg["poll"]
+        tick_fut = self._pool.submit(self.tickfeed.fetch) if self.cfg["ticks"].get("enabled", True) else None
         items, cursor = [], None
         for _ in range(max(1, int(pc["pages"]))):
             url = f"{base}/api/launches?sort={pc['sort']}" + (f"&cursor={cursor}" if cursor else "")
@@ -361,7 +367,16 @@ class Engine:
                     pass
         for a in listed:
             self._dirty.discard(a)
-        return items, listed
+        tick_res = None
+        if tick_fut is not None:
+            try:
+                ticks, gap = tick_fut.result(timeout=20)
+                tick_res = (ticks, gap, True)
+            except Exception as e:
+                self.status["tickErrors"] += 1
+                self.status["tickLastError"] = f"{_iso(time.time())} {e!r}"
+                tick_res = ([], True, False)
+        return items, listed, tick_res
 
     def _held_addrs(self):
         out = set()
@@ -371,10 +386,23 @@ class Engine:
         return out
 
     # ------------------------------------------------------------------ core tick (live + replay)
-    def tick(self, items, now, listed=None):
+    def tick(self, items, now, listed=None, live_ticks=None, tick_rows=None, tick_gap=False):
+        """live_ticks: (decoded trades, gap, ok) from the chain feed; tick_rows: recorded trades (replay)."""
         with self.lock:
             toks = self.market.ingest(items, now)
-            self._record(items, now)
+            rec_ticks = None
+            if live_ticks is not None:
+                raw, gap, ok = live_ticks
+                if gap or not ok:
+                    self.status["tickGaps"] += 1
+                    self.market.start_ticks(now)  # coverage restarts: windows aren't complete any more
+                rec_ticks = self.market.add_ticks(raw, now) if ok else None
+                self.status["tickCount"] += len(rec_ticks or [])
+            elif tick_rows is not None:
+                if tick_gap:
+                    self.market.start_ticks(now)
+                self.market.add_tick_rows(tick_rows, now)
+            self._record(items, now, rec_ticks, live_ticks is not None and (live_ticks[1] or not live_ticks[2]))
             if not self.live:
                 self.executor.process(now)
             ex = self.cfg["execution"]
@@ -688,7 +716,7 @@ class Engine:
         self.hall = self.hall[:15]
 
     # ------------------------------------------------------------------ recording (for replay/backtests)
-    def _record(self, items, now):
+    def _record(self, items, now, tick_rows=None, tick_gap=False):
         if not self.live or not self.cfg["record"]["enabled"]:
             return
         rows = []
@@ -705,8 +733,13 @@ class Engine:
             rows.append([a, d.get("stage"), d.get("lastTradeAt"), d.get("raisedQuote"), d.get("priceQuote"),
                          d.get("priceUsd"), d.get("marketCapUsd"), d.get("volumeUsd"), d.get("tradeCount"),
                          d.get("progress"), d.get("quoteUsd"), d.get("graduatedAt")])
-        if rows:
-            self._rec_buf.append(json.dumps({"t": round(now, 2), "u": rows}, separators=(",", ":")))
+        if rows or tick_rows is not None or tick_gap:
+            rec = {"t": round(now, 2), "u": rows}
+            if tick_rows is not None:
+                rec["x"] = tick_rows   # trades since the previous poll (present, possibly empty, while the feed works)
+            if tick_gap:
+                rec["xg"] = 1          # the feed missed something: rolling trade windows restart here
+            self._rec_buf.append(json.dumps(rec, separators=(",", ":")))
 
     def _flush_recording(self, force=False):
         if not self._rec_buf:
@@ -737,6 +770,8 @@ class Engine:
             st.update(tokens=len(self.market.tokens), pendingOrders=self.executor.pending(),
                       storage=self.store.kind if self.store else None,
                       memMB=memory_mb()[0], memPeakMB=memory_mb()[1],
+                      tickLagSec=(round(time.time() - self.tickfeed.last_block_ts, 1)
+                                  if self.tickfeed and self.tickfeed.last_block_ts else None),
                       storageError=getattr(self.store, "last_error", None),
                       executorError=self.executor.last_error,
                       chainCalls=self.chain.calls if self.chain else 0, chainFailures=self.chain.failures if self.chain else 0,
@@ -938,8 +973,8 @@ def snapshot_items(paths):
 
 
 def snapshot_records(lines):
-    """Yield (t, items) from recorded snapshot lines. Token metadata carries across files, so rows near an hour
-    boundary aren't dropped."""
+    """Yield (t, items, ticks, tick_gap) from recorded snapshot lines. ticks is None when the trade feed wasn't
+    running for that poll. Token metadata carries across files, so rows near an hour boundary aren't dropped."""
     meta = {}
     for line in lines:
         line = line.strip()
@@ -964,4 +999,4 @@ def snapshot_records(lines):
              d["volumeUsd"], d["tradeCount"], d["progress"], d["quoteUsd"], d["graduatedAt"]) = row[1:12]
             d["address"] = a
             items.append(d)
-        yield rec["t"], items
+        yield rec["t"], items, rec.get("x"), bool(rec.get("xg"))
