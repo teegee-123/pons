@@ -85,7 +85,7 @@ function renderHeader() {
   $("#liveDot").className = "dot " + (ok ? "ok" : "bad");
   $("#liveTxt").textContent = ok ? `live · poll ${st.lastPollMs}ms` : (st.lastError ? "poll error" : "waiting for data…");
   $("#liveTxt").parentElement.dataset.tip = esc(st.lastError || "") + `<br>polls ${st.polls}, errors ${st.pollErrors}, coverage gaps ${st.gaps}, direct refreshes ${st.refreshes}<br>chain quote calls ${st.chainCalls} (failed ${st.chainFailures})` +
-    (st.httpErrors ? `<br>HTTP errors ${st.httpErrors}: ${Object.entries(st.httpErrorKinds || {}).map(([k, n]) => `${esc(k)} ×${n}`).join(", ")}` : "") + `<br>storage: ${esc(st.storage)}` + (st.memMB ? ` · memory ${st.memMB} MB (peak ${st.memPeakMB})` : "") +
+    (st.httpErrors ? `<br>HTTP errors ${st.httpErrors}: ${Object.entries(st.httpErrorKinds || {}).map(([k, n]) => `${esc(k)} ×${n}`).join(", ")}` : "") + (st.handoffs ? `<br>took over from the previous instance at ${fTime(st.lastHandoffAt)}` : "") + `<br>storage: ${esc(st.storage)}` + (st.memMB ? ` · memory ${st.memMB} MB (peak ${st.memPeakMB})` : "") +
     (st.storageError ? " — " + esc(st.storageError) : "") + (st.executorError ? "<br>" + esc(st.executorError) : "");
   const k = (label, val, c = "") => `<div class="kpi"><b class="${c}">${val}</b><span>${label}</span></div>`;
   $("#kpis").innerHTML = k("manual strategies P&L", fSUsd(t.manualPnl), cls(t.manualPnl)) + k("all strategies P&L", fSUsd(t.allPnl), cls(t.allPnl)) +

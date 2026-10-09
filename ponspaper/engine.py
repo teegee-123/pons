@@ -26,6 +26,7 @@ from .ticks import TickFeed
 from .lab import DEFAULT_LAB, Lab
 
 CONFIG_VERSION = 3
+HANDOFF_SEC = 300  # after start, how long to watch for the replaced instance's final save
 
 DEFAULT_CONFIG = {
     "configVersion": CONFIG_VERSION,
@@ -180,6 +181,13 @@ class Engine:
         self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=8 if V.PUMP else 4) if live else None
         self.lab = Lab(self.cfg, random.Random(seed)) if live else None
         self._lab_rebuild = True
+        self._lab_reload = None
+        self._lab_wake = threading.Event()  # lets a handoff interrupt the lab's sleeps
+        # Deploy handoff: Render starts this instance and only stops the old one ~60 s later, when the old one saves
+        # its final state. Watch for that newer state for a few minutes and continue from it.
+        self._handoff_until = time.time() + HANDOFF_SEC if live and not fresh else 0.0
+        self._handoff_checked = 0.0
+        self._saved = False  # this instance has written its own state at least once
         if live and not fresh:
             self._load_state()
         if not self.runs:
@@ -237,11 +245,13 @@ class Engine:
         self.store.save_state(text)
         self.store.flush()
         self._last_save = time.time()
+        self._saved = True
 
-    def _load_state(self):
-        doc = self.store.load_state()
+    def _load_state(self, doc=None):
+        doc = doc or self.store.load_state()
         if not doc:
             return
+        self.runs = {}
         for rd in doc.get("runs", []):
             spec = S.normalize(rd["spec"], self.cfg["sizing"])
             self.runs[spec["id"]] = Run(spec, Portfolio.from_dict(rd.get("pf", {})), rd.get("last_entry", {}))
@@ -258,6 +268,38 @@ class Engine:
             except Exception as e:
                 self.lab.last_error = f"could not restore lab state: {e!r}"
 
+    def _check_handoff(self, now):
+        """During the first minutes after start: if a newer state was saved (by the instance this one replaced, as
+        it shut down), continue from it. This instance's own overlapping minute of trading is the same market and
+        the same strategies the old one was still trading, so it is simply dropped."""
+        if not self._handoff_until:
+            return
+        if now > self._handoff_until or self._saved:  # window over, or this instance's own state is the newest now
+            self._handoff_until = 0.0
+            return
+        if now - self._handoff_checked < 15:
+            return
+        self._handoff_checked = now
+        try:
+            updated = self.store.state_updated()
+            loaded = getattr(self.store, "loaded_at", None)
+            if updated is None or (loaded is not None and updated <= loaded + 0.5):
+                return
+            doc = self.store.load_state()
+        except Exception as e:
+            self.status["lastError"] = f"{_iso(now)} handoff check failed: {e!r}"
+            return
+        if not doc:
+            return
+        with self.lock:
+            lab_doc = doc.pop("lab", None)
+            self._load_state(doc)
+            self._lab_reload = lab_doc  # applied by the lab thread between steps
+            self._lab_wake.set()
+            self._dirty |= self._held_addrs()
+        self.status["handoffs"] = self.status.get("handoffs", 0) + 1
+        self.status["lastHandoffAt"] = now
+
     # ------------------------------------------------------------------ live loop
     def start(self):
         t = threading.Thread(target=self._loop, name="poller", daemon=True)
@@ -271,10 +313,19 @@ class Engine:
         never starves the live poller."""
         lab = self.lab
         while not self.stopping.is_set():
+            if self._lab_reload is not None:  # handoff: continue from the replaced instance's lab
+                fresh_lab = Lab(self.cfg, random.Random())
+                try:
+                    fresh_lab.load(self._lab_reload)
+                    self.lab = lab = fresh_lab
+                    self._lab_rebuild = True
+                except Exception as e:
+                    lab.last_error = f"could not take over the previous instance's lab: {e!r}"
+                self._lab_reload = None
             lc = self.cfg["lab"]
             if not lc.get("enabled", True):
                 lab.phase = "off"
-                self.stopping.wait(5)
+                self._lab_sleep(5)
                 continue
             duty = min(1.0, max(0.05, float(lc.get("duty", 0.5))))
 
@@ -301,19 +352,19 @@ class Engine:
                 if lab.gens_on_data >= lc.get("maxGensPerData", 50):
                     # more generations on the same data only overfit it: wait for the next refresh
                     lab.phase = "waiting for new data"
-                    self.stopping.wait(10)
+                    self._lab_sleep(10)
                     continue
                 lab.phase = "evolving"
                 lab.step(throttle)
             except ValueError as e:  # not enough recorded data yet
                 lab.last_error = str(e)
                 self._lab_rebuild = True
-                self.stopping.wait(300)
+                self._lab_sleep(300)
             except Exception as e:
                 lab.last_error = f"{_iso(time.time())} {e!r}"
                 lab.phase = "error (retrying)"
                 self._lab_rebuild = True
-                self.stopping.wait(60)
+                self._lab_sleep(60)
 
     def live_slippage(self, min_fills=20):
         """-> (per-side cost as a fraction, fills used): how much worse live fills were than the spot each strategy
@@ -331,8 +382,14 @@ class Engine:
         per_side = (trimmed_mean(buys) if buys else 0.0) / 2 - (trimmed_mean(sells) if sells else 0.0) / 2
         return min(0.2, max(0.0, per_side)), len(buys) + len(sells)
 
+    def _lab_sleep(self, sec):
+        """Sleep in the lab thread; returns early on shutdown or when a handoff needs the lab."""
+        self._lab_wake.wait(sec)
+        self._lab_wake.clear()
+
     def stop(self):
         self.stopping.set()
+        self._lab_wake.set()
         self._flush_recording(force=True)
         self.save_state()
 
@@ -348,6 +405,7 @@ class Engine:
             except Exception as e:
                 self.status["pollErrors"] += 1
                 self.status["lastError"] = f"{_iso(time.time())} {e!r}"
+            self._check_handoff(time.time())
             if time.time() - self._last_save > self.store.save_every:
                 self.save_state()
             self._flush_recording()
@@ -1096,6 +1154,7 @@ def snapshot_records(lines):
     running for that poll. Token metadata carries across files, so rows near an hour boundary aren't dropped.
     Rows are pons rows ("u") or compact pump.fun rows ("v")."""
     meta = {}
+    last_t = None
     for line in lines:
         line = line.strip()
         if not line:
@@ -1104,6 +1163,10 @@ def snapshot_records(lines):
             rec = json.loads(line)
         except ValueError:
             continue
+        if "t" in rec:  # during a deploy two instances record the same minute: drop polls that go back in time
+            if last_t is not None and rec["t"] <= last_t:
+                continue
+            last_t = rec["t"]
         if "m" in rec:
             m = rec["m"]
             meta[V.addr_key(m.get("address"))] = m

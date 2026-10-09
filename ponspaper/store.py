@@ -59,7 +59,15 @@ class FileStore:
         self._atomic_write(self._p("config.json"), json.dumps(cfg, indent=2))
 
     def load_state(self):
+        self.loaded_at = self.state_updated()
         return self._load_json("state.json")
+
+    def state_updated(self):
+        """When the saved state was last written (unix time), or None."""
+        try:
+            return os.path.getmtime(self._p("state.json"))
+        except OSError:
+            return None
 
     def save_state(self, text):
         self._atomic_write(self._p("state.json"), text)
@@ -182,7 +190,16 @@ class PgStore:
         self._run(lambda c: self._put(c, "config", json.dumps(cfg)))
 
     def load_state(self):
-        return self._get("state")
+        row = self._run(lambda c: (c.execute(f"select v, extract(epoch from updated) from {self.kv} where k='state'"),
+                                   c.fetchone())[1])
+        self.loaded_at = float(row[1]) if row else None
+        return json.loads(row[0]) if row else None
+
+    def state_updated(self):
+        """When the saved state was last written (unix time), or None."""
+        row = self._run(lambda c: (c.execute(f"select extract(epoch from updated) from {self.kv} where k='state'"),
+                                   c.fetchone())[1])
+        return float(row[0]) if row else None
 
     def save_state(self, text):
         with self._lock:

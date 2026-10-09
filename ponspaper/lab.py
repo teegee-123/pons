@@ -656,6 +656,8 @@ class Lab:
         new = {}
         picks = [e["genome"] for e in sorted(self.scored, key=lambda x: x["sel"], reverse=True)
                  if e["fit"] > CLONE and e["res"]["n"] >= lc["minTrades"]][: int(lc["ledgerAdd"])]
+        if not self.scored:  # just restarted: the population (elites first) is the best we have
+            picks = [S.genome(g) for g in self.pop[: int(lc["ledgerAdd"])]]
         picks += [h["genome"] for h in self.hall]
         picks += [f["genome"] for f in self.feedback.values() if f["status"] == "winning"]
         for g in picks:
