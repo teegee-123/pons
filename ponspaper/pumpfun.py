@@ -55,7 +55,10 @@ CONFIG = {
     # around 120 MB, so it fits a 512 MB server next to the live trader. dropBest: genomes are scored and examined
     # without their best trade, for the same reason as above.
     "lab": {"windowHours": 2, "sampleEverySec": 30, "candGapSec": 6, "calibrateSlippage": True, "dropBest": 1},
-    "edge": {"sampleEverySec": 300},  # thousands of coins an hour: sample each one less often
+    # thousands of coins an hour: sample each one less often. fillLatency: coins whose curve completes in the launch
+    # transaction can open on PumpSwap at the graduation price and trade x10,000 higher by the next poll (USDF went
+    # from $46k to $400M in 2 s), so a sample buys like a real order, at the first quote after latencyMs.
+    "edge": {"sampleEverySec": 300, "fillLatency": True},
     # ~50 launches a minute: record only coins in the trading universe (or held), skipping unchanged repeats,
     # so a free Postgres database holds a day or two of recordings
     "record": {"dedupeSec": 60, "universeOnly": True},

@@ -166,6 +166,14 @@ that is 3% better than the double-counted price at launch, 0.9% near graduation 
 applies while a position is a small part of the curve, as it always is on a standard curve; otherwise the plain
 price is used, which can never pay out more than the curve holds.
 
+**Edge-map buys wait for the latency.** Some coins' curves complete in the launch transaction and open on PumpSwap
+at the graduation price, then trade up to ×10,000 higher by the next poll: USDF went from $46k to $400M market cap
+within 2 seconds. Buying at the price that triggered the sample, one such coin (+565,000%) made the whole edge map
+look profitable, though nobody outside could have bought there. So on pump.fun an edge sample buys like a real
+order, at the first quote after `latencyMs` (*Edge buys wait for latency* under Settings → Polling, edge map & recording; changing it
+restarts the edge map; pons is unchanged). Replaying the first 5.8 hours, the 1-minute baseline went from +27% to
+−3%, and the biggest sample left is a ×35 run over 30 minutes.
+
 **Winners must not rest on one trade.** pump.fun returns are fat-tailed: rugs at −90%, the odd +300% pump. In the
 first hour, the top 6 live strategies all owed their score to one +394% trade, and 31 of the 44 live strategies had
 been bred from them. So on pump.fun (settings under Live evolution and Genetic lab; pons keeps its original rules):

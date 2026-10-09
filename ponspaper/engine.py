@@ -54,7 +54,8 @@ DEFAULT_CONFIG = {
                   "maxChildren": 0,        # live children one parent may have at once (0 = no limit)
                   "cloneOverlap": 1.0},    # retire a strategy sharing this share of its recent trades with an older one
     "lab": DEFAULT_LAB,
-    "edge": {"enabled": True, "sampleEverySec": 120, "horizonsMin": [1, 5, 15, 30], "sizeUsd": 50.0},
+    "edge": {"enabled": True, "sampleEverySec": 120, "horizonsMin": [1, 5, 15, 30], "sizeUsd": 50.0,
+             "fillLatency": False},  # buy at the first quote latencyMs after the signal (off on pons, see pumpfun.CONFIG)
     "record": {"enabled": True, "dedupeSec": 0},  # dedupeSec: skip a token's unchanged row for this long
     "ticks": {"enabled": True},
 }
@@ -1045,10 +1046,13 @@ class Engine:
             patch = {k: v for k, v in (patch or {}).items() if k in allowed}
             if "universe" in patch:
                 patch["universe"] = S.clean_filters(patch["universe"])
-            old_h = list(self.cfg["edge"]["horizonsMin"])
+            old_h, old_fill = list(self.cfg["edge"]["horizonsMin"]), self.cfg["edge"].get("fillLatency")
             self.cfg = deep_merge(self.cfg, patch)
             if self.cfg["edge"]["horizonsMin"] != old_h:
                 self.edge.reset_aggs()
+            if self.cfg["edge"].get("fillLatency") != old_fill:  # samples bought the other way must not mix
+                self.edge.reset_aggs()
+                self.edge.pending = []
             self.edge.cfg = self.cfg["edge"]
             if "evolution" in patch:
                 self._fill_population()

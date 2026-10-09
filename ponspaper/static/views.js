@@ -195,6 +195,7 @@ function renderSettings() {
     Object.entries(LAB_META).map(([k, m]) => fld("lab." + k, m, c.lab[k])).join("");
   $("#pollForm").innerHTML = Object.entries(POLL_META).filter(([k]) => !(pump && k === "poll.pages")).map(([k, m]) => { const [a, b] = k.split("."); return fld(k, vmeta(k, m), c[a][b]); }).join("") +
     chk("edge.enabled", "Edge map sampling", "Collect forward-return samples", c.edge.enabled) +
+    chk("edge.fillLatency", "Edge buys wait for latency", "Each sample buys like a real order: at the first quote after the order latency, not at the price that triggered it. Changing it restarts the edge map", c.edge.fillLatency) +
     chk("record.enabled", "Record snapshots", "Write every poll to data/snapshots for backtests", c.record.enabled);
   $("#setMsg").textContent = "";
   renderStorage();

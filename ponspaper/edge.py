@@ -3,6 +3,10 @@
 Every token in the trading universe is sampled periodically as a hypothetical buy of `sizeUsd` (model fill with
 fees + impact + gas). At each horizon we value a hypothetical sell the same way. Averaging those net returns per
 feature bucket shows which conditions have had positive expectancy after costs.
+
+With `fillLatency` (pump.fun) the buy lands `latencyMs` after the signal, like a real order, and is priced at the
+first quote after that: coins whose curve completes in the launch transaction can jump x10,000 within one poll, and
+a buy at the price that triggered the sample would have been impossible.
 """
 import json
 import os
@@ -101,19 +105,28 @@ class EdgeMap:
         if now - self.last_sample.get(tok.addr, 0) < self.cfg["sampleEverySec"]:
             return
         d = tok.d
-        v, qu = model_venue(d, ex), d.get("quoteUsd")
-        if v is None or not qu:
-            return
-        size = self.cfg["sizeUsd"]
-        tokens, used = v.buy((size - ex["gasUsd"]) / qu)
-        if tokens <= 0:
+        bought = self._buy(d, ex)
+        if bought is None:
             return
         self.last_sample[tok.addr] = now
         b = {k: bucket(k, feats.get(k)) for k in BUCKETS}
         raw = {k: (round(feats[k], 4) if isinstance(feats.get(k), float) else feats.get(k)) for k in BUCKETS}
-        self.pending.append({"addr": tok.addr, "sym": d.get("symbol"), "t": now, "tokens": tokens,
-                             "cost": used * qu + ex["gasUsd"], "b": b, "raw": raw,
-                             "rets": [None] * len(self.cfg["horizonsMin"])})
+        s = {"addr": tok.addr, "sym": d.get("symbol"), "t": now, "tokens": bought[0], "cost": bought[1], "b": b,
+             "raw": raw, "rets": [None] * len(self.cfg["horizonsMin"])}
+        if self.cfg.get("fillLatency"):  # priced when the order lands (resolve)
+            s["tokens"] = s["cost"] = None
+            s["fillAt"] = now + ex["latencyMs"] / 1000.0
+        self.pending.append(s)
+
+    def _buy(self, d, ex):
+        """-> (tokens, cost in USD) of a `sizeUsd` buy on token dict d, or None if it can't be priced."""
+        v, qu = model_venue(d, ex), d.get("quoteUsd")
+        if v is None or not qu:
+            return None
+        tokens, used = v.buy((self.cfg["sizeUsd"] - ex["gasUsd"]) / qu)
+        if tokens <= 0:
+            return None
+        return tokens, used * qu + ex["gasUsd"]
 
     def due_addrs(self, now, market):
         """Tokens whose next horizon is due but whose data predates it (so the engine can refresh them)."""
@@ -135,6 +148,16 @@ class EdgeMap:
         done = []
         for s in self.pending:
             tok = market.get(s["addr"])
+            if s["tokens"] is None:
+                if now < s["fillAt"]:
+                    keep.append(s)
+                    continue
+                # the newest quote: a coin that traded since the signal is in this poll's lists sorted by last trade
+                bought = self._buy(tok.d, ex) if tok is not None else None
+                if bought is None:
+                    continue  # nothing to buy at any more: the sample is dropped
+                s["tokens"], s["cost"] = bought
+                s["t"] = now  # horizons count from the fill
             for i, h in enumerate(hs):
                 if s["rets"][i] is not None:
                     continue
@@ -200,10 +223,11 @@ class EdgeMap:
 
     def to_dict(self):
         return {"agg": self.agg, "grid": self.grid, "base": self.base, "samples": self.samples,
-                "horizons": self.cfg["horizonsMin"], "pricing": PRICING}
+                "horizons": self.cfg["horizonsMin"], "pricing": PRICING, "fillLatency": bool(self.cfg.get("fillLatency"))}
 
     def load(self, d):
-        if not d or d.get("horizons") != self.cfg["horizonsMin"] or d.get("pricing", 1) != PRICING:
+        if (not d or d.get("horizons") != self.cfg["horizonsMin"] or d.get("pricing", 1) != PRICING
+                or d.get("fillLatency", False) != bool(self.cfg.get("fillLatency"))):  # samples bought the other way
             return
         try:
             for k in BUCKETS:
