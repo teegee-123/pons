@@ -12,6 +12,8 @@ Pipeline
      stress test (extra latency and fees). Champions are re-checked whenever the data refreshes.
   5. Scoring favours simple rules (penalty per filter), steady equity (drawdown penalty), more trades when
      profitable, and different ideas (genomes that trade the same tokens as many others are marked down).
+     With dropBest (pump.fun), genomes are scored and examined without their best trade(s), so a strategy whose
+     profit is one lucky pump can't win.
   6. Live feedback: champions that fail in live paper trading are blacklisted and their close relatives are
      marked down; live winners are fed back into the population.
   7. Slippage calibration (calibrateSlippage): recorded snapshots can't show how far the price moves between a
@@ -32,7 +34,7 @@ import time
 
 from . import strategy as S
 from .market import Market
-from .sim import model_venue
+from .sim import model_venue, sell_gross
 
 CLONE = -1000.0  # fitness given to a genome that duplicates another's trades
 SERIES_CAP = 160  # long-run record: chart points per genome; when full, neighbours merge so it spans the whole life
@@ -51,6 +53,7 @@ DEFAULT_LAB = {"enabled": True, "windowHours": 12, "validateFrac": 0.3, "populat
                # scoring
                "complexityPenalty": 0.5, "consistencyPenalty": 4.0, "ddPenalty": 0.1, "activityBonus": 0.5,
                "nicheSimilarity": 0.5, "nichePenalty": 1.0,
+               "dropBest": 0,  # best trades left out of scoring and exams (pump.fun: 1; 0 keeps pons as it was)
                # live feedback
                "feedbackPenalty": 3.0, "feedbackBonus": 1.5,
                # long-run record (forward test on every new stretch of data)
@@ -161,7 +164,7 @@ def _buy(p, quote_in):
 
 def _sell_usd(p, tokens):
     Q, T, sellable, ff, qu, _ = p
-    return tokens * Q / (T + tokens) * (1.0 - ff) * qu
+    return sell_gross(Q, T, tokens) * (1.0 - ff) * qu
 
 
 def compile_filters(filters):
@@ -358,10 +361,11 @@ class Evaluator:
         n = len(rets)
         mean = sum(rets) / n if n else None
         sd = statistics.pstdev(rets) if n > 1 else None
+        top = heapq.nlargest(5, rets)
         res = {"n": n, "mean": mean, "sd": sd, "lcb": (mean - sd / math.sqrt(n)) if n > 1 else None,
                "win": (sum(1 for r in rets if r > 0) / n) if n else None, "pnl": pnl, "maxDD": dd / self.bankroll,
                "avgHoldMin": (sum(holds) / n / 60.0) if n else None, "missed": missed, "reasons": reasons,
-               "sig": hash(tuple(sig)), "nfilters": len(enum) + len(rng)}
+               "sig": hash(tuple(sig)), "nfilters": len(enum) + len(rng), "top": top}
         if nf:
             res["folds"] = [[fold_n[x], fold_sum[x] / fold_n[x] if fold_n[x] else None] for x in range(nf)]
             res["consistency"] = sum(1 for x in range(nf) if fold_n[x] and fold_sum[x] > 0) / nf
@@ -372,21 +376,38 @@ class Evaluator:
         return res
 
 
+def robust_mean(res, drop):
+    """Average net return per trade with the `drop` best trades left out (None if that leaves none)."""
+    n = res["n"]
+    if not drop or not n:
+        return res["mean"]
+    if n <= drop:
+        return None
+    return (res["mean"] * n - sum(res["top"][:drop])) / (n - drop)
+
+
+def _positive(x):
+    return x is not None and x > 0
+
+
 def fitness(res, lc, hours):
-    """-> (fitness, parts). Base = lower 1-sigma bound of average net return per trade (%), then:
+    """-> (fitness, parts). Base = lower 1-sigma bound of average net return per trade (%), the average taken
+    without the `dropBest` best trades, then:
     - per active filter (simpler rules generalise better)
     - for training slices that weren't profitable (consistency)
     - for drawdown beyond 10% of bankroll
     + a small bonus for trading more often, only when the average is positive.
     Below minTrades a genome is ranked by trade count only, below every qualifying genome."""
     n = res["n"]
-    if n < max(2, lc["minTrades"]):
+    drop = int(lc.get("dropBest") or 0)
+    if n < max(2, lc["minTrades"], drop + 2):
         return UNQUALIFIED + 2.0 * n, {"trades": n}
-    parts = {"base": 100.0 * res["lcb"],
+    mean = robust_mean(res, drop)
+    parts = {"base": 100.0 * (mean - res["sd"] / math.sqrt(n)) if drop else 100.0 * res["lcb"],
              "simplicity": -lc["complexityPenalty"] * res.get("nfilters", 0),
              "consistency": -lc["consistencyPenalty"] * (1.0 - res.get("consistency", 1.0)),
              "drawdown": -lc["ddPenalty"] * max(0.0, 100.0 * res["maxDD"] - 10.0),
-             "activity": lc["activityBonus"] * math.log2(1.0 + n / max(0.1, hours)) if res["mean"] > 0 else 0.0}
+             "activity": lc["activityBonus"] * math.log2(1.0 + n / max(0.1, hours)) if mean > 0 else 0.0}
     return sum(parts.values()), parts
 
 
@@ -613,6 +634,10 @@ class Lab:
         self.pop = nxt
         self.gen += 1
         self.gens_on_data += 1
+        if self.gens_on_data == int(lc.get("maxGensPerData", 50)):
+            # the round is over: its best start their out-of-sample record from the end of this data, which gives
+            # them the whole next stretch instead of waiting for the refresh
+            self._ledger_track(self.ds.t1)
         self.gen_secs = time.time() - t0
 
     # ---- long-run record
@@ -652,7 +677,11 @@ class Lab:
             self.ledger_segs += 1
         elif self.ledger_t is None:
             self.ledger_t = seg_to
-        # start tracking: this round's best genomes, champions and live winners, from the end of this window on
+        self._ledger_track(ds.t1)
+
+    def _ledger_track(self, since):
+        """Start tracking this round's best genomes, champions and live winners, scored on data after `since`."""
+        lc = self.lc
         new = {}
         picks = [e["genome"] for e in sorted(self.scored, key=lambda x: x["sel"], reverse=True)
                  if e["fit"] > CLONE and e["res"]["n"] >= lc["minTrades"]][: int(lc["ledgerAdd"])]
@@ -663,7 +692,7 @@ class Lab:
         for g in picks:
             k = S.genome_key(g)
             if k not in self.ledger and k not in new:
-                new[k] = {"genome": S.genome(g), "since": ds.t1, "added": time.time(), "seen": 0, "segs": 0, "pos": 0,
+                new[k] = {"genome": S.genome(g), "since": since, "added": time.time(), "seen": 0, "segs": 0, "pos": 0,
                           "n": 0, "sr": 0.0, "sr2": 0.0, "wins": 0, "pnl": 0.0, "series": [], "status": "tracking",
                           "last": None}
         ledger = {**self.ledger, **new}
@@ -711,8 +740,11 @@ class Lab:
     def _exam(self, g, fit=None, parts=None, res=None):
         """Full champion check -> (passed, entry, reason). Train: enough trades, positive average, profitable
         in most slices. Validation: enough trades and positive. Stress (whole window, worse latency and fees):
-        positive. Not blacklisted by live results."""
+        positive. Each average also has to stay positive without the `dropBest` best trades. Not blacklisted by
+        live results."""
         lc = self.lc
+        drop = int(lc.get("dropBest") or 0)
+        lucky = f"only profitable because of its best trade{'s' if drop > 1 else ''}"
         if res is None:
             fit, parts, res = self._judge(g)
         key = S.genome_key(g)
@@ -723,17 +755,25 @@ class Lab:
             return False, entry, "failed in live trading"
         if fit <= CLONE or res["n"] < lc["minTrades"] or not res["mean"] or res["mean"] <= 0:
             return False, entry, "not profitable on training data"
+        if not _positive(robust_mean(res, drop)):
+            return False, entry, f"training: {lucky}"
         if (res.get("consistency") or 0) < lc["minFoldShare"]:
             return False, entry, "profitable in too few training slices"
         val = self.ev.evaluate(g, t_from=self.split)
         entry["val"] = _brief(val)
         if val["n"] < lc["minValTrades"] or not val["mean"] or val["mean"] <= 0:
             return False, entry, "failed validation"
+        val_mean = robust_mean(val, drop)
+        if not _positive(val_mean):
+            return False, entry, f"validation: {lucky}"
         stress = self.ev_stress.evaluate(g)
         entry["stress"] = _brief(stress)
         if stress["n"] < lc["minTrades"] or not stress["mean"] or stress["mean"] <= 0:
             return False, entry, "failed the stress test"
-        entry["rank"] = min(fit, 100.0 * val["mean"], 100.0 * stress["mean"])
+        stress_mean = robust_mean(stress, drop)
+        if not _positive(stress_mean):
+            return False, entry, f"stress test: {lucky}"
+        entry["rank"] = min(fit, 100.0 * val_mean, 100.0 * stress_mean)
         entry["vec"] = gene_vector(g)
         return True, entry, None
 

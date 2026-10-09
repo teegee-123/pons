@@ -82,8 +82,7 @@ def cmd_replay(a):
         last = t
         n += 1
     span = (last - first) / 3600 if first else 0
-    k = cfg["evolution"]["shrinkK"]
-    rows = sorted((eng._row(r, k) for r in eng.runs.values()), key=lambda x: x["score"], reverse=True)
+    rows = sorted((eng._row(r) for r in eng.runs.values()), key=lambda x: x["score"], reverse=True)
     hall = eng.hall
     print(f"\n{n} snapshots, {span:.1f}h of market data, {eng.epoch} evolution epochs, {time.time() - t0:.1f}s\n")
     print(f"{'score%':>7} {'trades':>6} {'win%':>5} {'pnl$':>9} {'maxDD':>6}  strategy")

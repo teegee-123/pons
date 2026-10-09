@@ -2,7 +2,21 @@
 import math
 from collections import deque
 
+from . import venue as V
 from .market import curve_params
+
+# A paper buy never reaches the chain, so the reserves we read later don't contain it. Selling into them as they are
+# charges the price impact twice: once on the way in, and again on the way out from a lower starting point. On
+# pump.fun a sell is priced on the curve as it would stand with our buy in it, so a round trip with nobody else
+# trading returns what went in minus fees (about 3% better than the double-counted price for a $50 order at launch).
+OWN_BUY_IN_RESERVES = V.PUMP
+
+
+def sell_gross(Q, T, tokens):
+    """Quote out (before fees) for selling `tokens` that we bought earlier into reserves (Q, T)."""
+    if OWN_BUY_IN_RESERVES:
+        return tokens * Q / max(T - tokens, 0.1 * T)  # the reserve as it would stand with our buy in it
+    return tokens * Q / (T + tokens)
 
 
 class Venue:
@@ -34,8 +48,7 @@ class Venue:
         return out, quote_in
 
     def sell(self, tokens_in):
-        gross = tokens_in * self.Q / (self.T + tokens_in)
-        return gross * (1.0 - self.fee_frac)
+        return sell_gross(self.Q, self.T, tokens_in) * (1.0 - self.fee_frac)
 
 
 def model_venue(d, ex):

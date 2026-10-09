@@ -71,6 +71,8 @@ def make_handler(engine):
                 return self._send(200, engine.lab_view())
             if p == "/api/market":
                 return self._send(200, engine.market_view())
+            if p == "/api/storage":
+                return self._send(200, engine.storage_view())
             if p == "/api/trades":
                 return self._send(200, engine.trades_view())
             if p == "/api/edge":
@@ -126,6 +128,11 @@ def make_handler(engine):
             if p == "/api/save":
                 engine.save_state()
                 return self._send(200, {"ok": True})
+            if p == "/api/storage/clean":
+                try:
+                    return self._send(200, engine.storage_clean(b))
+                except (TypeError, ValueError):
+                    return self._send(400, {"error": "days must be numbers"})
             return self._send(404, {"error": "not found"})
 
     return Handler

@@ -22,7 +22,8 @@ NAME = _pick(os.environ.get("PONS_VENUE"))
 PUMP = NAME == "pumpfun"
 
 # signals built from pump.fun data (reserves between polls, all-time high, livestreams, replies, creator wallet)
-PUMP_ONLY = frozenset({"inflow1m", "inflow5m", "fillRate", "athDdPct", "live", "replies", "creatorCoins", "mayhem"})
+PUMP_ONLY = frozenset({"inflow1m", "inflow5m", "fillRate", "athDdPct", "live", "replies", "creatorCoins", "mayhem",
+                       "depthUsd"})
 
 if PUMP:
     LABEL = "pump.fun"
@@ -32,10 +33,9 @@ if PUMP:
     FILE_PREFIX = "pumpfun"
     TOKEN_URL = "https://pump.fun/coin/"
     FORGET_IDLE_SEC = 1800                         # pump.fun launches ~50 coins a minute: forget quiet ones sooner
-    TRADE_KEEP_DAYS = 7                            # ~1,300 paper trades an hour: prune stored trades after a week
     # entry conditions saved with every closed trade (trades.csv)
     TRADE_FEAT_COLS = ["ageMin", "mcapUsd", "progressPct", "chg1m", "chg5m", "chg15m", "ddPeak", "idleSec", "socials",
-                       "inflow1m", "inflow5m", "fillRate", "athDdPct", "replies", "creatorCoins", "live", "mayhem"]
+                       "inflow1m", "inflow5m", "fillRate", "athDdPct", "replies", "creatorCoins", "live", "mayhem", "depthUsd"]
     # signals the pump.fun API can't provide (no lifetime volume / trade count, no creator tax, no tick feed yet)
     UNAVAILABLE = frozenset({"volumeUsd", "tradeCount", "tpm1", "vol1m", "taxBps", "buyback", "buyRatio1m",
                              "netFlow1m", "buyers5m", "sellers5m", "whale1m", "volSpike", "devSoldUsd"})
@@ -47,7 +47,6 @@ else:
     FILE_PREFIX = "pons"
     TOKEN_URL = "https://robin.etherscan.io/token/"
     FORGET_IDLE_SEC = 7200
-    TRADE_KEEP_DAYS = 0                            # keep every trade
     TRADE_FEAT_COLS = ["ageMin", "mcapUsd", "progressPct", "chg1m", "chg5m", "tpm1", "vol1m", "ddPeak", "taxBps", "socials"]
     UNAVAILABLE = PUMP_ONLY  # pons keeps exactly its original signal set
 

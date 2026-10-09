@@ -36,10 +36,22 @@ CONFIG = {
         "hookFeeBps": 125,         # PumpSwap after graduation: tiered by market cap, 1.25% for small coins
         "useChainQuotes": True,    # fill on the curve / pool read from Solana when the order lands
     },
-    "universe": {"quote": {"in": ["SOL"]}, "ageMin": {"min": None, "max": 1440}},
+    # Coins the simulator can't price are left out:
+    # - curve depth: normal curves start at 30 SOL (~$3k); non-standard ones can hold well under 1 SOL, where a $50
+    #   order is many times the curve and neither paper fills nor real trades make sense;
+    # - Mayhem mode: the program moves these curves' virtual reserves without trades (one lost 55% of its virtual
+    #   SOL in 75 s while sellers took out 0.05 SOL), so constant-product pricing doesn't hold, and their real SOL
+    #   reserves are a few dollars, far less than a $50 position's paper value.
+    "universe": {"quote": {"in": ["SOL"]}, "ageMin": {"min": None, "max": 1440}, "depthUsd": {"min": 1500, "max": None},
+                 "mayhem": {"in": ["no"]}},
+    # Live evolution: pump.fun returns are fat-tailed (rugs at -90%, the odd +300% pump), so one trade must not make a
+    # strategy a winner: scores leave out each strategy's best trade, only strategies with 6+ closed trades breed,
+    # one parent has at most 3 live children, and strategies trading mostly the same coins as an older one retire.
+    "evolution": {"scoreDropBest": True, "parentMinTrades": 6, "maxChildren": 3, "cloneOverlap": 0.7},
     # busy venue: a shorter window and at most one entry candidate per coin every 6 s keep the lab's dataset
-    # around 120 MB, so it fits a 512 MB server next to the live trader
-    "lab": {"windowHours": 2, "sampleEverySec": 30, "candGapSec": 6, "calibrateSlippage": True},
+    # around 120 MB, so it fits a 512 MB server next to the live trader. dropBest: genomes are scored and examined
+    # without their best trade, for the same reason as above.
+    "lab": {"windowHours": 2, "sampleEverySec": 30, "candGapSec": 6, "calibrateSlippage": True, "dropBest": 1},
     "edge": {"sampleEverySec": 300},  # thousands of coins an hour: sample each one less often
     # ~50 launches a minute: record only coins in the trading universe (or held), skipping unchanged repeats,
     # so a free Postgres database holds a day or two of recordings

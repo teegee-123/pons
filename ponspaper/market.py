@@ -232,6 +232,13 @@ class Token:
         out["live"] = None if d.get("isLive") is None else ("yes" if d["isLive"] else "no")
         out["mayhem"] = None if d.get("mayhem") is None else ("yes" if d["mayhem"] else "no")
         out["creatorCoins"] = sum(1 for c in self.peers.values() if c >= now - 86400) if self.peers is not None else None
+        res, pool_k, p = d.get("reserves"), d.get("poolK"), d.get("priceQuote")
+        if curve and res and res[0] and qu:
+            out["depthUsd"] = res[0] * qu
+        elif not curve and pool_k and p and qu:  # the modelled pool's quote reserve
+            out["depthUsd"] = math.sqrt(pool_k * p) * qu
+        else:
+            out["depthUsd"] = None
         return out
 
 

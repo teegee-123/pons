@@ -37,6 +37,7 @@ FILTERS = {
     "athDdPct":    ("Below ATH", "%", "range", "How far market cap is below its all-time high (pump.fun's record, not just the last 30 min)"),
     "replies":     ("Replies", "#", "range", "Comments on the coin's pump.fun page"),
     "creatorCoins": ("Creator's coins 24h", "#", "range", "Coins the same wallet launched in the last 24h, this one included (launches seen since start-up)"),
+    "depthUsd":    ("Curve depth", "$", "range", "Quote in the bonding curve's virtual reserve (the pool's, once graduated), USD. A normal pump.fun curve starts with 30 SOL; much less means a non-standard curve too thin to trade"),
     "live":        ("Livestream", "", "enum", "The creator is livestreaming on pump.fun right now"),
     "mayhem":      ("Mayhem mode", "", "enum", "Launched in pump.fun's Mayhem mode: an AI agent trades it and the curve is non-standard (often very thin)"),
     "stage":       ("Stage", "", "enum", "curve = still on the bonding curve, graduated = trading in the DEX pool"),
@@ -285,7 +286,8 @@ def describe(spec):
                                     ("buyers5m", "buyers", "", 1), ("sellers5m", "sellers", "", 1), ("whale1m", "whale", "$", 1),
                                     ("volSpike", "spike", "x", 1), ("devSoldUsd", "devsold", "$", 1),
                                     ("inflow1m", "in1m", "$", 1), ("inflow5m", "in5m", "$", 1), ("fillRate", "speed", "%/m", 1),
-                                    ("athDdPct", "ath-dd", "%", 1), ("replies", "replies", "", 1), ("creatorCoins", "devcoins", "", 1)):
+                                    ("athDdPct", "ath-dd", "%", 1), ("replies", "replies", "", 1), ("creatorCoins", "devcoins", "", 1),
+                                    ("depthUsd", "depth", "$", 1)):
         t = rng_txt(key, unit, scale)
         if t:
             parts.append(f"{label} {t}")

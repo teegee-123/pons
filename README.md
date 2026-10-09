@@ -144,6 +144,30 @@ can't be read, fills fall back to a fresh pump.fun API read (`api` in the Fills 
 | Livestream | the creator is streaming on pump.fun right now |
 | Replies | comments on the coin's page |
 | Creator's coins 24h | coins the same wallet launched in the last day (serial launchers), counted since start-up |
+| Curve depth | quote in the curve's virtual reserve (the pool's once graduated), USD; a normal curve starts at 30 SOL |
+
+**Coins it can't price are left out.** The default universe skips two kinds of coin, because neither paper fills
+nor real trades make sense on them (both can be switched back on under Settings → Trading universe):
+- **Curve depth under $1,500.** Some non-standard curves hold well under 1 SOL, so a $50 order is many times the
+  curve. Before this rule, coins under $1k market cap made 66 of the first 995 trades and lost 52% each on average,
+  mostly within seconds.
+- **Mayhem mode.** The program moves these curves' virtual reserves without anyone trading (one lost 55% of its
+  virtual SOL in 75 seconds while sellers took out 0.05 SOL), so constant-product pricing doesn't hold, and their
+  real SOL reserves are a few dollars, far less than a position's paper value.
+
+**Sell pricing.** A paper buy never reaches the chain, so the reserves read later don't contain it. Selling into
+them as they are would charge the price impact twice. On pump.fun a sell is priced on the curve as it would stand
+with our buy in it, so a round trip with nobody else trading returns what went in minus fees. For a $50 order
+that is 3% better than the double-counted price at launch, 0.9% near graduation (pons is unchanged).
+
+**Winners must not rest on one trade.** pump.fun returns are fat-tailed: rugs at −90%, the odd +300% pump. In the
+first hour, the top 6 live strategies all owed their score to one +394% trade, and 31 of the 44 live strategies had
+been bred from them. So on pump.fun (settings under Live evolution and Genetic lab; pons keeps its original rules):
+- **Score without best trade:** each live strategy's score leaves out its best closed trade.
+- **Breed after 6 trades:** only strategies with 6+ closed trades are parents of new ones.
+- **Max 3 children:** one strategy has at most 3 live children at once.
+- **Clone overlap 0.7:** a strategy whose recent trades are 70%+ the same as an older one's is retired.
+- **Lab: leave out best trades = 1:** genomes are scored, and must pass every exam, without their best trade.
 
 **Genetic lab.** Trains on the last 2 hours, with at most one entry candidate per coin every 6 seconds
 (*Candidate spacing*), which keeps it near 120 MB of memory on a 512 MB server. Recorded snapshots can't show how
@@ -170,7 +194,12 @@ connection string into `DATABASE_URL` when asked.
 
 - **Storage:** Render's free disk is wiped on every restart, so with `DATABASE_URL` set, state, trades and
   recordings go to Postgres. They're written every 15 minutes (`PONS_DB_SAVE_SEC`), plus on shutdown; a crash can
-  lose up to 15 minutes. Recordings older than 10 days are deleted (`PONS_DB_KEEP_DAYS`).
+  lose up to 15 minutes.
+- **Nothing is deleted automatically.** Settings → Database shows the database size, what recordings and trades take,
+  how far back they go and how fast they grow, and has a button to delete recordings and/or stored trades older than
+  a number of days (the lab's own data window is always kept). The tables are then rewritten so the database really
+  shrinks. Keep an eye on the size: a full database refuses every write, including the saved state, so progress
+  stops being saved (the unsaved backlog in memory is capped, so the service itself keeps running).
 - **Staying awake:** free services sleep after 15 minutes without visitors. Point an uptime monitor (e.g.
   UptimeRobot, every 5 minutes) at `https://<your-service>.onrender.com/health`.
 - **Downloads:** the Trades tab downloads every trade as CSV; the Backtest tab downloads the recording. Replay it
@@ -184,10 +213,9 @@ Deploy the same repo again (e.g. from another free Render account) with `PONS_VE
 `render-pumpfun.yaml`. Or create a Web Service by hand with the same build/start commands and environment variables.
 `render.yaml` is unchanged, so the existing pons service is not affected.
 
-- **Stored trades** are deleted after 7 days on pump.fun (`PONS_DB_TRADE_KEEP_DAYS`; pons keeps all), and if the
-  database refuses writes the unsaved backlog in memory is capped, so a full free database can't crash the service.
 - **Database:** use a separate free database if you can. Sharing one with pons also works, because the tables
-  are prefixed (`pons_*` / `pump_*`). Recordings are kept for 1 day (`PONS_DB_KEEP_DAYS=1`), about 150 MB.
+  are prefixed (`pons_*` / `pump_*`). pump.fun writes far more than pons (recordings of every coin in the universe
+  plus ~1,000 paper trades an hour), so check Settings → Database regularly and delete old data from there.
 - **Solana RPC:** add `SOLANA_RPC_URL` with your private RPC URL (recommended).
 
 ## Exporting strategies and trades

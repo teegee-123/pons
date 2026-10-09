@@ -8,7 +8,7 @@ import os
 import random
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime
 
 from . import pumpfun
@@ -25,7 +25,7 @@ from .store import open_store
 from .ticks import TickFeed
 from .lab import DEFAULT_LAB, Lab
 
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 HANDOFF_SEC = 300  # after start, how long to watch for the replaced instance's final save
 
 DEFAULT_CONFIG = {
@@ -47,7 +47,12 @@ DEFAULT_CONFIG = {
     "sizing": {"sizeUsd": 50.0, "maxOpen": 5, "bankrollUsd": 1000.0, "cooldownMin": 60.0},
     "evolution": {"enabled": True, "population": 40, "epochMin": 10, "minTrades": 6, "judgeAfterMin": 60,
                   "cullFrac": 0.3, "mutateFrac": 0.7, "idleEpochs": 3, "shrinkK": 5, "stuckMin": 45,
-                  "retireClones": True},
+                  "retireClones": True,
+                  # off on pons (its original behaviour); pump.fun turns them on (see pumpfun.CONFIG)
+                  "scoreDropBest": False,  # score each strategy without its best closed trade
+                  "parentMinTrades": 0,    # closed trades a live strategy needs before it can be bred from
+                  "maxChildren": 0,        # live children one parent may have at once (0 = no limit)
+                  "cloneOverlap": 1.0},    # retire a strategy sharing this share of its recent trades with an older one
     "lab": DEFAULT_LAB,
     "edge": {"enabled": True, "sampleEverySec": 120, "horizonsMin": [1, 5, 15, 30], "sizeUsd": 50.0},
     "record": {"enabled": True, "dedupeSec": 0},  # dedupeSec: skip a token's unchanged row for this long
@@ -71,7 +76,7 @@ FEAT_KEEP = ["ageMin", "mcapUsd", "progressPct", "chg1m", "chg5m", "chg15m", "tp
              "idleSec", "taxBps", "socials", "stage", "buyRatio1m", "netFlow1m", "buyers5m", "sellers5m", "whale1m",
              "volSpike", "devSoldUsd"]
 if V.PUMP:
-    FEAT_KEEP += ["inflow1m", "inflow5m", "fillRate", "athDdPct", "replies", "creatorCoins", "live", "mayhem"]
+    FEAT_KEEP += ["inflow1m", "inflow5m", "fillRate", "athDdPct", "replies", "creatorCoins", "live", "mayhem", "depthUsd"]
 
 
 def deep_merge(base, patch):
@@ -104,13 +109,17 @@ class Run:
     def holds(self, addr):
         return any(p.addr == addr for p in self.pf.positions.values())
 
-    def score(self, k=5):
+    def score(self, k=5, drop_best=False):
         """Mark-to-market expected net return per trade (%): closed trades plus open positions valued at what
-        selling now would return, shrunk toward 0 by k phantom zero-return trades."""
+        selling now would return, shrunk toward 0 by k phantom zero-return trades. drop_best: leave the best closed
+        trade out, so a single lucky trade can't make a strategy look like a winner."""
         s = self.pf.stats
         opens = list(self.pf.positions.values())
         tot = s["sum_ret"] + sum(p.mark_ret for p in opens)
         cnt = s["n"] + len(opens)
+        if drop_best and s["n"] and s["best"] is not None:
+            tot -= s["best"]
+            cnt -= 1
         return 100.0 * tot / (cnt + k) if cnt else 0.0
 
     def mtm_pnl(self):
@@ -151,6 +160,9 @@ class Engine:
             if saved and saved.get("configVersion", 1) < 3:  # v3: a champion needs far more validation trades
                 self.cfg["lab"]["minValTrades"] = max(self.cfg["lab"].get("minValTrades", 0),
                                                       DEFAULT_CONFIG["lab"]["minValTrades"])
+            if V.PUMP and saved and saved.get("configVersion", 1) < 4:  # v4: pump.fun skips coins it can't price
+                for key in ("depthUsd", "mayhem"):
+                    self.cfg["universe"].setdefault(key, copy.deepcopy(DEFAULT_CONFIG["universe"][key]))
             self.cfg["configVersion"] = CONFIG_VERSION
         self.market = Market()
         self.runs = {}
@@ -223,12 +235,23 @@ class Engine:
         spec["name"] = f"A-{spec['id'][2:7]}" + (f" g{gen}" if gen else "")
         return Run(spec)
 
+    def _score(self, r):
+        ev = self.cfg["evolution"]
+        return r.score(ev["shrinkK"], ev.get("scoreDropBest", False))
+
     def _fill_population(self, parents=None):
+        ev = self.cfg["evolution"]
         autos = [r for r in self.runs.values() if r.spec["kind"] == "auto"]
-        need = int(self.cfg["evolution"]["population"]) - len(autos)
+        need = int(ev["population"]) - len(autos)
+        cap = int(ev.get("maxChildren") or 0)
+        kids = Counter(r.spec.get("parent") for r in autos)
         for _ in range(max(0, need)):
-            if parents and self.rng.random() < self.cfg["evolution"]["mutateFrac"]:
-                run = self._new_auto(self.rng.choice(parents))
+            # a parent with `cap` live children already makes room for other ideas
+            open_parents = [p for p in parents or [] if not cap or kids[p.spec["id"]] < cap]
+            if open_parents and self.rng.random() < ev["mutateFrac"]:
+                parent = self.rng.choice(open_parents)
+                kids[parent.spec["id"]] += 1
+                run = self._new_auto(parent)
             else:
                 run = self._new_auto()
             self.runs[run.spec["id"]] = run
@@ -342,9 +365,8 @@ class Engine:
                               throttle=throttle)
                     lab.last_error = None
                     with self.lock:
-                        k = self.cfg["evolution"]["shrinkK"]
                         winners = [r.spec for r in self.runs.values()
-                                   if r.pf.stats["n"] >= self.cfg["evolution"]["minTrades"] and r.score(k) > 0]
+                                   if r.pf.stats["n"] >= self.cfg["evolution"]["minTrades"] and self._score(r) > 0]
                         seeds = [r.spec for r in self.runs.values()] + [h["spec"] for h in self.hall if h.get("spec")]
                     if not lab.pop:
                         lab.seed(seeds)
@@ -778,7 +800,6 @@ class Engine:
         now = now or time.time()
         with self.lock:
             ev = self.cfg["evolution"]
-            k = ev["shrinkK"]
             self.epoch += 1
             self.last_epoch = now
             autos = [r for r in self.runs.values() if r.spec["kind"] == "auto"]
@@ -786,42 +807,50 @@ class Engine:
             # judged once it has enough closed trades OR has been alive long enough with any exposure
             judged = [r for r in autos if r.pf.stats["n"] >= ev["minTrades"]
                       or (age(r) >= ev["judgeAfterMin"] and r.pf.stats["n"] + len(r.pf.positions) > 0)]
-            judged.sort(key=lambda r: r.score(k))
+            judged.sort(key=self._score)
             retire = {}
             n_cull = int(len(judged) * ev["cullFrac"]) if len(judged) >= 4 else 0
             for r in judged[:n_cull]:
-                if r.score(k) < 0:
+                if self._score(r) < 0:
                     retire[r.spec["id"]] = (r, "underperformed")
             for r in autos:
                 if r.stuck_minutes(now) >= ev["stuckMin"] and r.mtm_pnl() < 0:
                     retire.setdefault(r.spec["id"], (r, f"stuck: a position under water for {r.stuck_minutes(now):.0f}m"))
             if ev.get("retireClones", True):
-                seen = {}
+                # the same recent trades as an older strategy (or, with cloneOverlap below 1, mostly the same) make
+                # it the same strategy, whatever its rules say
+                thr = float(ev.get("cloneOverlap", 1.0))
+                kept = []  # (recent trades, name) of the older strategies that stay
                 for r in sorted(autos, key=lambda r: r.spec.get("created", 0)):
                     sig = r.signature()
                     if sig is None:
                         continue
-                    if sig in seen:
-                        retire.setdefault(r.spec["id"], (r, f"clone of {seen[sig]}"))
+                    sig = set(sig)
+                    ov, twin = max(((len(o & sig) / len(o | sig), name) for o, name in kept), default=(0.0, None))
+                    if ov >= thr:
+                        retire.setdefault(r.spec["id"], (r, f"clone of {twin}" if ov >= 1.0 else
+                                                         f"{ov:.0%} the same trades as {twin}"))
                     else:
-                        seen[sig] = r.spec["name"]
+                        kept.append((sig, r.spec["name"]))
             idle_after = ev["idleEpochs"] * ev["epochMin"] * 60
             for r in autos:
                 if (r.pf.stats["n"] == 0 and not r.pf.positions and not r.pf.reserved
                         and now - r.spec.get("created", now) >= idle_after):
                     retire.setdefault(r.spec["id"], (r, "never traded"))
             # never wipe out more than half the population in one epoch
-            victims = sorted(retire.values(), key=lambda x: x[0].score(k))[: max(1, len(autos) // 2)]
+            victims = sorted(retire.values(), key=lambda x: self._score(x[0]))[: max(1, len(autos) // 2)]
             if self.lab is not None:
                 judged_ids = {r.spec["id"] for r in judged}
                 for r in autos:
                     if r.spec.get("origin") == "lab" and r.spec["id"] in judged_ids:
-                        self.lab.record_live(r.spec, "winning" if r.score(k) > 0 else "losing", r.score(k),
-                                             r.pf.stats["n"], r.mtm_pnl())
+                        sc = self._score(r)
+                        self.lab.record_live(r.spec, "winning" if sc > 0 else "losing", sc, r.pf.stats["n"], r.mtm_pnl())
             for r in judged:
-                self._hall_update(r, k, now)
-            parents = judged[-max(1, len(judged) // 4):] if judged else []
-            parents = [p for p in parents if p.score(k) > 0 and p.spec["id"] not in retire] or [
+                self._hall_update(r, now)
+            # parents: the best quarter of the strategies with enough closed trades to tell skill from luck
+            breeders = [r for r in judged if r.pf.stats["n"] >= int(ev.get("parentMinTrades") or 0)]
+            parents = breeders[-max(1, len(breeders) // 4):] if breeders else []
+            parents = [p for p in parents if self._score(p) > 0 and p.spec["id"] not in retire] or [
                 p for p in parents if p.spec["id"] not in retire]
             for r, why in victims:
                 if r.spec["id"] not in self.runs:
@@ -831,11 +860,10 @@ class Engine:
             self._fill_population(parents)
 
     def _retire(self, r, why, now):
-        k = self.cfg["evolution"]["shrinkK"]
         if self.lab is not None and r.spec.get("origin") == "lab":
-            self.lab.record_live(r.spec, "failed", r.score(k), r.pf.stats["n"], r.mtm_pnl(), why)
+            self.lab.record_live(r.spec, "failed", self._score(r), r.pf.stats["n"], r.mtm_pnl(), why)
         self.retired.appendleft({"id": r.spec["id"], "name": r.spec["name"], "desc": S.describe(r.spec),
-                                 "gen": r.spec.get("gen", 0), "score": r.score(k), "summary": r.pf.summary(),
+                                 "gen": r.spec.get("gen", 0), "score": self._score(r), "summary": r.pf.summary(),
                                  "at": now, "why": why})
         del self.runs[r.spec["id"]]
 
@@ -849,14 +877,13 @@ class Engine:
             picks = self.lab.pick(force_keys)
         else:
             picks = self.lab.champions(int(lc["promoteCount"]))
-        k = self.cfg["evolution"]["shrinkK"]
         added = []
         live_keys = {S.genome_key(S.genome(r.spec)) for r in self.runs.values()}
         for h in picks:
             if h["key"] in live_keys:
                 self.lab.deployed.add(h["key"])
                 continue
-            autos = sorted((r for r in self.runs.values() if r.spec["kind"] == "auto"), key=lambda r: r.score(k))
+            autos = sorted((r for r in self.runs.values() if r.spec["kind"] == "auto"), key=self._score)
             if autos and len(autos) >= int(self.cfg["evolution"]["population"]):
                 self._retire(autos[0], "replaced by a lab champion", time.time())
             spec = S.normalize({"kind": "auto", "filters": h["genome"]["filters"], "exits": h["genome"]["exits"],
@@ -867,9 +894,9 @@ class Engine:
             added.append(spec)
         return added
 
-    def _hall_update(self, r, k, now):
+    def _hall_update(self, r, now):
         entry = {"id": r.spec["id"], "name": r.spec["name"], "desc": S.describe(r.spec), "spec": r.spec,
-                 "score": r.score(k), "summary": r.pf.summary(), "at": now}
+                 "score": self._score(r), "summary": r.pf.summary(), "at": now}
         self.hall = [h for h in self.hall if h["id"] != r.spec["id"]] + [entry]
         self.hall.sort(key=lambda h: h["score"], reverse=True)
         self.hall = self.hall[:15]
@@ -928,16 +955,15 @@ class Engine:
         self.store.append_snapshots(buf)
 
     # ------------------------------------------------------------------ views for the dashboard
-    def _row(self, r, k):
+    def _row(self, r):
         s = r.pf.summary()
         return {"id": r.spec["id"], "name": r.spec["name"], "kind": r.spec["kind"], "enabled": r.spec.get("enabled", True),
-                "gen": r.spec.get("gen", 0), "desc": S.describe(r.spec), "score": r.score(k), **s,
+                "gen": r.spec.get("gen", 0), "desc": S.describe(r.spec), "score": self._score(r), **s,
                 "curve": [p[1] for p in r.pf.equity_curve[-90:]]}
 
     def state_view(self):
         with self.lock:
-            k = self.cfg["evolution"]["shrinkK"]
-            rows = [self._row(r, k) for r in self.runs.values()]
+            rows = [self._row(r) for r in self.runs.values()]
             rows.sort(key=lambda x: x["score"], reverse=True)
             man = [x for x in rows if x["kind"] == "manual"]
             st = dict(self.status)
@@ -968,12 +994,11 @@ class Engine:
             if r is None:
                 h = next((h for h in self.hall if h["id"] == sid), None)
                 return {"spec": h["spec"], "dead": True, "summary": h["summary"]} if h else None
-            k = self.cfg["evolution"]["shrinkK"]
             now = time.time()
             pos = [{"id": p.id, "sym": p.symbol, "addr": p.addr, "age": now - p.t_entry, "cost": p.cost_usd,
                     "value": p.mark_usd, "ret": p.mark_ret, "peak": p.peak_ret, "drift": p.entry_drift,
                     "exiting": p.exiting, "src": p.src, "feats": p.feats} for p in r.pf.positions.values()]
-            return {"spec": r.spec, "row": self._row(r, k), "positions": pos, "trades": list(r.pf.trades)[:100],
+            return {"spec": r.spec, "row": self._row(r), "positions": pos, "trades": list(r.pf.trades)[:100],
                     "equity": r.pf.equity_curve, "cash": r.pf.cash}
 
     def market_view(self, limit=120):
@@ -1032,6 +1057,26 @@ class Engine:
                     self._lab_rebuild = True
             self.save_config()
             return self.cfg
+
+    def storage_view(self):
+        """Database card: what the recordings and stored trades take (nothing is ever deleted automatically)."""
+        u = self.store.usage()
+        u["labWindowHours"] = self.cfg["lab"]["windowHours"]
+        return u
+
+    def storage_clean(self, body):
+        """Dashboard button: delete recordings and/or stored trades older than the given number of days (empty = keep
+        all). The recordings the lab trains on (its data window) are always kept. Strategy stats, the hall of fame and
+        the lab's long-run record live in the saved state and aren't touched."""
+        def days(key, floor):
+            v = body.get(key)
+            return None if v is None or v == "" else max(floor, float(v))
+        rec = days("recordingsDays", self.cfg["lab"]["windowHours"] / 24.0)
+        trades = days("tradesDays", 0.0)
+        before = self.store.usage()["databaseBytes"]
+        out = self.store.clean(rec, trades) if rec is not None or trades is not None else {"deleted": {}, "compacted": True}
+        out.update(recordingsDays=rec, tradesDays=trades, bytesBefore=before, bytesAfter=self.store.usage()["databaseBytes"])
+        return out
 
     def lab_view(self):
         if self.lab is None:

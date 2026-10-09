@@ -18,5 +18,3 @@ services:
         sync: false
       - key: PONS_DB_SAVE_SEC  # how often state, trades and recordings are written to the database
         value: "900"
-      - key: PONS_DB_KEEP_DAYS # pump.fun records far more than pons: keep one day to fit a free database
-        value: "1"

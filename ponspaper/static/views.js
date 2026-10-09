@@ -29,6 +29,7 @@ async function renderMarket() {
     ["inflow1m", "Inflow 1m", "net buys into the curve", t => `<td class="n ${cls(t.inflow1m)}">${t.inflow1m == null ? "–" : fSUsd(t.inflow1m, 0)}</td>`],
     ["inflow5m", "Inflow 5m", "net buys into the curve", t => `<td class="n ${cls(t.inflow5m)}">${t.inflow5m == null ? "–" : fSUsd(t.inflow5m, 0)}</td>`],
     ["fillRate", "Speed", "curve progress per minute", t => `<td class="n">${t.fillRate == null ? "–" : fNum(t.fillRate, 1) + "%/m"}</td>`],
+    ["depthUsd", "Depth", "quote in the curve's virtual reserve (normal curves start at 30 SOL)", t => `<td class="n">${t.depthUsd == null ? "–" : fUsd(t.depthUsd, 0)}</td>`],
     ["ddPeak", "Below peak", "", t => `<td class="n">${t.ddPeak == null ? "–" : fNum(t.ddPeak, 0) + "%"}</td>`],
     ["athDdPct", "Below ATH", "", t => `<td class="n">${t.athDdPct == null ? "–" : fNum(t.athDdPct, 0) + "%"}</td>`],
     ["live", "Live", "creator is livestreaming", t => `<td class="n">${t.live === "yes" ? "● live" : ""}</td>`],
@@ -120,6 +121,9 @@ const EVO_META = {
   mutateFrac: ["Mutate fraction", "0-1", "Share of replacements bred from winners (the rest are random, for exploration)"],
   idleEpochs: ["Retire idle after", "epochs", "Auto strategies that never trade are replaced after this many epochs"],
   shrinkK: ["Score shrinkage", "trades", "Phantom zero-return trades added to the score; higher = more skeptical of small samples"],
+  parentMinTrades: ["Breed after", "trades", "Closed trades a strategy needs before new strategies are bred from it (0 = any judged strategy)"],
+  maxChildren: ["Max children", "#", "Live children one strategy may have at once, so one idea can't take over the population (0 = no limit)"],
+  cloneOverlap: ["Clone overlap", "0-1", "Retire a strategy whose recent trades overlap this much with an older one's (1 = only exact clones)"],
 };
 const LAB_META = {
   windowHours: ["Data window", "h", "How many hours of recorded data the lab trains and validates on"],
@@ -155,6 +159,7 @@ const LAB_META = {
   longRunWeight: ["Long-run breeding weight", "×", "How much the long-run record (avg return minus 1 std. error, %) adds to breeding fitness; 0 = ignore it"],
   ledgerSize: ["Genomes tracked", "#", "How many genomes the long-run record follows (proven ones are never dropped)"],
   ledgerAdd: ["New per refresh", "#", "Best genomes of each round that start being tracked"],
+  dropBest: ["Leave out best trades", "#", "Genomes are scored and must pass every exam without this many of their best trades, so one lucky trade can't make a champion (0 = off)"],
 };
 const POLL_META = {
   "poll.intervalSec": ["Poll interval", "s", "How often /api/launches?sort=active is fetched"],
@@ -183,7 +188,8 @@ function renderSettings() {
   $("#sizeForm").innerHTML = Object.entries(S.meta.sizing).map(([k, d]) => fld("sizing." + k, [d.label, d.unit, d.help], c.sizing[k])).join("");
   $("#evoForm").innerHTML = chk("evolution.enabled", "Evolution on", "Retire losers and breed winners every epoch", c.evolution.enabled) +
     Object.entries(EVO_META).map(([k, m]) => fld("evolution." + k, m, c.evolution[k])).join("") +
-    chk("evolution.retireClones", "Retire clones", "Retire auto strategies that make exactly the same trades as an older one", c.evolution.retireClones);
+    chk("evolution.retireClones", "Retire clones", "Retire auto strategies that make the same trades as an older one (see Clone overlap)", c.evolution.retireClones) +
+    chk("evolution.scoreDropBest", "Score without best trade", "Leave each strategy's best closed trade out of its score, so one lucky trade can't make it a winner or a parent", c.evolution.scoreDropBest);
   $("#labForm").innerHTML = chk("lab.enabled", "Lab on", "Run the genetic algorithm in the background on recorded data", c.lab.enabled) +
     chk("lab.calibrateSlippage", "Charge live slippage", "Charge every simulated trade the slippage measured on live fills (signal spot vs fill), so the lab matches live results", c.lab.calibrateSlippage) +
     Object.entries(LAB_META).map(([k, m]) => fld("lab." + k, m, c.lab[k])).join("");
@@ -191,14 +197,50 @@ function renderSettings() {
     chk("edge.enabled", "Edge map sampling", "Collect forward-return samples", c.edge.enabled) +
     chk("record.enabled", "Record snapshots", "Write every poll to data/snapshots for backtests", c.record.enabled);
   $("#setMsg").textContent = "";
+  renderStorage();
 }
+
+// ---------- database ----------
+const fBytes = b => b == null ? "–" : b >= 1e9 ? fNum(b / 1e9, 2) + " GB" : b >= 1e6 ? fNum(b / 1e6, 1) + " MB" : fNum(b / 1e3, 0) + " kB";
+async function renderStorage() {
+  let u;
+  try { u = await api("/api/storage"); } catch (e) { $("#dbStats").innerHTML = `<div class="dim">Couldn't read the database: ${esc(e.message)}</div>`; return; }
+  const span = x => x.from ? `${fDur(Date.now() / 1000 - x.from)} back` : "none";
+  // growth: recordings + trades over the time they cover
+  const days = Math.max(u.recordings.to && u.recordings.from ? (u.recordings.to - u.recordings.from) / 86400 : 0, u.trades.to && u.trades.from ? (u.trades.to - u.trades.from) / 86400 : 0);
+  const perDay = days > 0.05 ? (u.recordings.bytes + u.trades.bytes) / days : null;
+  const stat = (k, v, t = "") => `<div class="stat"${t ? ` data-tip="${esc(t)}"` : ""}><span>${k}</span><b>${v}</b></div>`;
+  $("#dbStats").innerHTML =
+    stat(u.kind === "postgres" ? "Database" : "Data folder", fBytes(u.databaseBytes)) +
+    stat("Recordings", fBytes(u.recordings.bytes), `${fNum(u.recordings.rows, 0)} ${u.recordings.unit}, oldest ${span(u.recordings)}`) +
+    stat("Trades", fBytes(u.trades.bytes), u.trades.rows != null ? `${fNum(u.trades.rows, 0)} trades, oldest ${span(u.trades)}` : "") +
+    stat("Oldest recording", span(u.recordings)) +
+    stat("Growth", perDay ? fBytes(perDay) + "/day" : "–", "Recordings + trades, averaged over the time they cover") +
+    (u.pending && (u.pending.recordings || u.pending.trades) ? stat("Not yet saved", `${fNum(u.pending.recordings + u.pending.trades, 0)} rows`, "Written at the next save") : "");
+}
+$("#btnDbClean").onclick = async () => {
+  const rec = $("#dbRecDays").value, tr = $("#dbTradeDays").value;
+  if (rec === "" && tr === "") { $("#dbMsg").textContent = "Enter a number of days for recordings, trades or both."; return; }
+  const what = [rec !== "" ? `recordings older than ${rec} days` : null, tr !== "" ? `stored trades older than ${tr} days` : null].filter(Boolean).join(" and ");
+  if (!confirm(`Permanently delete ${what}? This can't be undone.`)) return;
+  $("#dbMsg").textContent = "Deleting and compacting…";
+  try {
+    const r = await api("/api/storage/clean", { recordingsDays: rec === "" ? null : Number(rec), tradesDays: tr === "" ? null : Number(tr) });
+    const d = r.deleted || {};
+    $("#dbMsg").textContent = `Deleted ${fNum(d.recordings || 0, 0)} recording chunks and ${fNum(d.trades || 0, 0)} trades. ${fBytes(r.bytesBefore)} → ${fBytes(r.bytesAfter)}.` +
+      (r.compacted ? "" : " (the database couldn't be compacted, so its size stays the same, but new data now reuses the freed space)") +
+      (r.recordingsDays != null && rec !== "" && Number(rec) < r.recordingsDays ? ` Kept the lab's last ${fNum(r.recordingsDays * 24, 0)}h of recordings.` : "");
+    toast("Old data deleted");
+  } catch (e) { $("#dbMsg").textContent = "Failed: " + e.message; }
+  renderStorage();
+};
 $("#btnSaveSettings").onclick = async () => {
   const patch = { universe: readFilters($("#uniForm"), "uni") };
   $$("[data-s]").forEach(i => {
     const [a, b] = i.dataset.s.split(".");
     const v = i.type === "checkbox" ? i.checked : (i.value === "" ? null : Number(i.value));
     if (v === null) return;
-    (patch[a] ??= {})[b] = (a === "sizing" && b === "maxOpen") || ["population", "minTrades", "idleEpochs", "pages", "elite", "tournament", "minValTrades", "promoteCount", "maxGensPerData", "folds", "stressLatencyMs", "stressFeeBps", "ledgerSize", "ledgerAdd", "provenSegments", "provenTrades"].includes(b) ? Math.round(v) : v;
+    (patch[a] ??= {})[b] = (a === "sizing" && b === "maxOpen") || ["population", "minTrades", "idleEpochs", "pages", "elite", "tournament", "minValTrades", "promoteCount", "maxGensPerData", "folds", "stressLatencyMs", "stressFeeBps", "ledgerSize", "ledgerAdd", "provenSegments", "provenTrades", "parentMinTrades", "maxChildren", "dropBest"].includes(b) ? Math.round(v) : v;
   });
   await api("/api/settings", patch);
   await refresh(); renderSettings();

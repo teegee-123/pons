@@ -3,8 +3,9 @@
 The Postgres store buffers trades and snapshot recordings in memory and writes them together with the state
 every PONS_DB_SAVE_SEC seconds (default 600), so a free serverless database isn't kept awake by constant writes.
 Table names start with the venue (pons_*, pump_*), so a pons and a pump.fun service can share one database.
-Stored trades older than PONS_DB_TRADE_KEEP_DAYS are deleted (default: never on pons, 7 days on pump.fun). If the
-database refuses writes (e.g. a full free database), unsaved data is kept in memory only up to a cap.
+Nothing is ever deleted automatically: usage() reports what the data takes and clean() deletes old recordings or
+trades when asked to (the dashboard's Database card). If the database refuses writes (e.g. a full free database),
+unsaved data is kept in memory only up to a cap.
 """
 import csv
 import glob
@@ -24,6 +25,14 @@ TRADE_FIELDS = ["exit_time", "strategy_id", "strategy", "kind", "symbol", "addre
                 "cost_usd", "proceeds_usd", "pnl_usd", "ret_pct", "reason", "entry_drift_pct", "fill_src"] + V.TRADE_FEAT_COLS
 
 
+def _local_ts(s):
+    """trades.csv exit_time (local time) -> unix time; unreadable values count as new, so they are kept."""
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        return float("inf")
+
+
 def open_store(data_dir):
     url = os.environ.get("DATABASE_URL")
     if url:
@@ -37,6 +46,7 @@ class FileStore:
 
     def __init__(self, data_dir):
         self.dir = data_dir
+        self._trades_lock = threading.Lock()  # clean() rewrites trades.csv while the engine appends to it
         os.makedirs(data_dir, exist_ok=True)
 
     def _p(self, name):
@@ -81,15 +91,16 @@ class FileStore:
 
     def append_trade(self, row):
         path = self._p("trades.csv")
-        new = not os.path.exists(path)
-        try:
-            with open(path, "a", newline="", encoding="utf8") as fh:
-                w = csv.writer(fh)
-                if new:
-                    w.writerow(TRADE_FIELDS)
-                w.writerow(row)
-        except OSError:
-            pass
+        with self._trades_lock:
+            new = not os.path.exists(path)
+            try:
+                with open(path, "a", newline="", encoding="utf8") as fh:
+                    w = csv.writer(fh)
+                    if new:
+                        w.writerow(TRADE_FIELDS)
+                    w.writerow(row)
+            except OSError:
+                pass
 
     def append_snapshots(self, lines):
         d = self._p("snapshots")
@@ -131,6 +142,53 @@ class FileStore:
                 out.write(fh.read())
         return out.getvalue()
 
+    def _snapshot_files(self):
+        """[(hour start as unix time, path)] of the hourly recording files, oldest first."""
+        out = []
+        for path in sorted(glob.glob(self._p(os.path.join("snapshots", "*.jsonl.gz")))):
+            try:
+                out.append((datetime.strptime(os.path.basename(path)[:13], "%Y-%m-%d_%H").timestamp(), path))
+            except ValueError:
+                continue
+        return out
+
+    def usage(self):
+        files = self._snapshot_files()
+        size = lambda p: os.path.getsize(p) if os.path.exists(p) else 0
+        rec = sum(size(p) for _, p in files)
+        trades, state = size(self._p("trades.csv")), size(self._p("state.json"))
+        return {"kind": self.kind, "databaseBytes": rec + trades + state,
+                "recordings": {"bytes": rec, "rows": len(files), "unit": "hourly files",
+                               "from": files[0][0] if files else None, "to": files[-1][0] + 3600 if files else None},
+                "trades": {"bytes": trades, "rows": None, "from": None, "to": None},
+                "state": {"bytes": state}, "pending": {"recordings": 0, "trades": 0}}
+
+    def clean(self, rec_days=None, trade_days=None):
+        """Delete hourly recording files and trades.csv rows older than the given number of days."""
+        now, done = time.time(), {}
+        if rec_days is not None:
+            old = [p for t, p in self._snapshot_files() if t + 3600 <= now - rec_days * 86400]
+            for p in old:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            done["recordings"] = len(old)
+        if trade_days is not None:
+            path, cut = self._p("trades.csv"), now - trade_days * 86400
+            with self._trades_lock:
+                try:
+                    with open(path, newline="", encoding="utf8") as fh:
+                        rows = list(csv.reader(fh))
+                except OSError:
+                    rows = []
+                if rows:
+                    keep = [r for r in rows[1:] if r and _local_ts(r[0]) >= cut]
+                    with open(path, "w", newline="", encoding="utf8") as fh:
+                        csv.writer(fh).writerows([rows[0]] + keep)
+                    done["trades"] = len(rows) - 1 - len(keep)
+        return {"deleted": done, "compacted": True}
+
 
 class PgStore:
     kind = "postgres"
@@ -142,8 +200,6 @@ class PgStore:
         self.dir = data_dir
         self.kv, self.tr, self.sn = f"{prefix}_kv", f"{prefix}_trades", f"{prefix}_snapshots"
         self.save_every = float(os.environ.get("PONS_DB_SAVE_SEC", "600"))
-        self.keep_days = float(os.environ.get("PONS_DB_KEEP_DAYS", "10"))
-        self.trade_keep_days = float(os.environ.get("PONS_DB_TRADE_KEEP_DAYS") or V.TRADE_KEEP_DAYS)
         self._lock = threading.Lock()
         self._db_lock = threading.RLock()
         self._trades = []
@@ -220,8 +276,6 @@ class PgStore:
         if state is None and not trades and not snaps:
             return
         blob = gzip.compress(("\n".join(snaps) + "\n").encode()) if snaps else None
-        cut = time.time() - self.keep_days * 86400
-        cut_trades = time.time() - self.trade_keep_days * 86400 if self.trade_keep_days > 0 else None
 
         def write(c):
             if state is not None:
@@ -230,9 +284,6 @@ class PgStore:
                 c.execute(f"insert into {self.tr} (row) values (%s::jsonb)", (json.dumps(r),))
             if blob:
                 c.execute(f"insert into {self.sn} (data) values (%s)", (blob,))
-                c.execute(f"delete from {self.sn} where t < to_timestamp(%s)", (cut,))
-            if cut_trades is not None:
-                c.execute(f"delete from {self.tr} where t < to_timestamp(%s)", (cut_trades,))
         try:
             self._run(write)
             self.last_error = None
@@ -270,6 +321,51 @@ class PgStore:
         with self._lock:
             pending = list(self._snaps)
         yield from pending
+
+    def usage(self):
+        """What the database holds: total size, and size / rows / time span of recordings and trades."""
+        def q(c):
+            c.execute("select pg_database_size(current_database())")
+            out = {"kind": self.kind, "databaseBytes": c.fetchone()[0]}
+            for name, table in (("recordings", self.sn), ("trades", self.tr)):
+                c.execute(f"select pg_total_relation_size(%s::regclass), count(*), extract(epoch from min(t)), "
+                          f"extract(epoch from max(t)) from {table}", (table,))
+                size, rows, t0, t1 = c.fetchone()
+                out[name] = {"bytes": size, "rows": rows, "unit": "chunks" if name == "recordings" else "trades",
+                             "from": float(t0) if t0 is not None else None, "to": float(t1) if t1 is not None else None}
+            c.execute("select pg_total_relation_size(%s::regclass)", (self.kv,))
+            out["state"] = {"bytes": c.fetchone()[0]}
+            return out
+        out = self._run(q)
+        with self._lock:
+            out["pending"] = {"recordings": len(self._snaps), "trades": len(self._trades)}
+        return out
+
+    def clean(self, rec_days=None, trade_days=None):
+        """Delete recordings / stored trades older than the given number of days, then rewrite the tables so the
+        space is handed back (Postgres keeps a table's size after a delete until it is rewritten)."""
+        cut = time.time()
+        done = {}
+
+        def delete(c):
+            for name, table, days in (("recordings", self.sn, rec_days), ("trades", self.tr, trade_days)):
+                if days is not None:
+                    c.execute(f"delete from {table} where t < to_timestamp(%s)", (cut - days * 86400,))
+                    done[name] = c.rowcount
+        self._run(delete)
+        compacted = True
+        for name, table in (("recordings", self.sn), ("trades", self.tr)):
+            if not done.get(name):
+                continue
+            try:  # needs room for a copy of what is kept; a database at its size limit may refuse
+                self._run(lambda c: c.execute(f"vacuum full {table}"))
+            except Exception:
+                compacted = False
+                try:  # the freed space is at least reused by new writes, so the database stops growing
+                    self._run(lambda c: c.execute(f"vacuum {table}"))
+                except Exception:
+                    pass
+        return {"deleted": done, "compacted": compacted}
 
     def snapshots_gz(self):
         rows = self._run(lambda c: (c.execute(f"select data from {self.sn} order by id"), c.fetchall())[1]) or []

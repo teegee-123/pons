@@ -194,9 +194,19 @@ a { color: var(--accent); text-decoration: none; }
 
   <section id="tab-settings" class="hidden">
     <div class="grid2">
+      <div>
       <div class="card"><h2>Trading universe <small>applies to every strategy</small></h2>
         <p class="help">Global filters for what we will trade at all. Strategy filters (and the auto-search) only narrow inside this. Leave a box empty to ignore it.</p>
         <div id="uniForm"></div></div>
+      <div class="card"><h2>Database <small>nothing is deleted automatically</small></h2>
+        <p class="help">Recordings and closed trades are kept until you delete them here. Watch the size against your database plan's limit: a full database refuses every write, including the saved state (strategies, lab, long-run record).</p>
+        <div class="statgrid" id="dbStats"><div class="dim">Loading…</div></div>
+        <div class="form2">
+          <label data-tip="The lab only trains on its data window; older recordings are only used for downloads and replays on your PC. The lab's window is always kept.">Delete recordings older than <span class="u">days</span></label><input type="number" step="any" min="0" id="dbRecDays" placeholder="keep all">
+          <label data-tip="Only affects the trades download and exports. Strategy stats, the hall of fame and the long-run record are kept in the saved state.">Delete stored trades older than <span class="u">days</span></label><input type="number" step="any" min="0" id="dbTradeDays" placeholder="keep all">
+        </div>
+        <div class="row" style="margin-top:8px"><button class="btn danger" id="btnDbClean">Delete old data</button><span class="dim" id="dbMsg"></span></div></div>
+      </div>
       <div>
         <div class="card"><h2>Execution: fees &amp; latency</h2><div class="form2" id="exForm"></div></div>
         <div class="card"><h2>Default sizing <small>new strategies</small></h2><div class="form2" id="sizeForm"></div></div>

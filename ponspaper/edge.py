@@ -36,6 +36,7 @@ BUCKETS = {
     "athDdPct":    [10, 30, 50, 75],
     "replies":     [1, 5, 20],
     "creatorCoins": [2, 3, 5],
+    "depthUsd":    [1500, 4000, 6000, 9000, 12000],
 }
 BUCKETS = {k: v for k, v in BUCKETS.items() if k not in V.UNAVAILABLE}
 GRID = ("ageMin", "mcapUsd")
