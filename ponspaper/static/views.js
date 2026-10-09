@@ -7,17 +7,44 @@ async function renderMarket() {
   let toks = v.tokens;
   if ($("#mktUni").checked) toks = toks.filter(t => t.inUniverse);
   $("#mktSub").textContent = `${toks.length} shown, most recently traded first`;
+  const vn = S.meta.venue, off = new Set(vn.unavailable);
   const chg = x => `<td class="n ${cls(x)}">${fP(x, 1)}</td>`;
-  $("#mktTbl").innerHTML = `<tr><th>Token</th><th>Stage</th><th class="n">Age</th><th class="n">Mcap</th><th class="n">Progress</th><th class="n">1m</th><th class="n">5m</th><th class="n">15m</th>
-    <th class="n">Trades/min</th><th class="n">Vol/min</th><th class="n" title="tick data">Buy share</th><th class="n" title="tick data">Net flow</th><th class="n" title="tick data">Buyers 5m</th><th class="n" title="tick data">Biggest buy</th><th class="n" title="tick data">Spike</th><th class="n" title="tick data">Creator sold</th><th class="n">Below peak</th><th class="n">Trades</th><th class="n">Tax</th><th class="n">Socials</th><th class="n">Idle</th><th>Universe</th><th class="n">Held by</th></tr>` +
-    toks.map(t => `<tr><td><a href="https://robin.etherscan.io/token/${t.addr}" target="_blank" rel="noopener"><b>${esc(t.sym)}</b></a> <span class="dim">${esc((t.name || "").slice(0, 22))}</span>${t.quote !== "ETH" ? ` <span class="tag">${esc(t.quote)}</span>` : ""}</td>
-      <td>${esc(t.stage)}</td><td class="n">${fMin(t.ageMin)}</td><td class="n">${fK(t.mcapUsd)}</td><td class="n">${t.progressPct == null ? "–" : fNum(t.progressPct, 0) + "%"}</td>
-      ${chg(t.chg1m)}${chg(t.chg5m)}${chg(t.chg15m)}<td class="n">${t.tpm1 == null ? "–" : fNum(t.tpm1, 1)}</td><td class="n">${t.vol1m == null ? "–" : fUsd(t.vol1m, 0)}</td>
-      <td class="n">${t.buyRatio1m == null ? "–" : fNum(t.buyRatio1m, 0) + "%"}</td><td class="n ${cls(t.netFlow1m)}">${t.netFlow1m == null ? "–" : fSUsd(t.netFlow1m, 0)}</td>
-      <td class="n">${t.buyers5m ?? "–"}</td><td class="n">${t.whale1m == null ? "–" : fUsd(t.whale1m, 0)}</td>
-      <td class="n">${t.volSpike == null ? "–" : fNum(t.volSpike, 1) + "×"}</td><td class="n ${t.devSoldUsd > 0 ? "neg" : ""}">${t.devSoldUsd == null ? "–" : fUsd(t.devSoldUsd, 0)}</td>
-      <td class="n">${t.ddPeak == null ? "–" : fNum(t.ddPeak, 0) + "%"}</td><td class="n">${fNum(t.tradeCount, 0)}</td><td class="n">${t.taxBps}</td><td class="n">${t.socials}</td>
-      <td class="n">${fDur(t.idleSec)}</td><td>${t.inUniverse ? "✓ yes" : '<span class="dim">no</span>'}</td><td class="n">${t.held || ""}</td></tr>`).join("");
+  const tick = "tick data";
+  // [feature key or null, header, title, cell]
+  const cols = [
+    [null, "Token", "", t => `<td><a href="${vn.tokenUrl}${t.addr}" target="_blank" rel="noopener"><b>${esc(t.sym)}</b></a> <span class="dim">${esc((t.name || "").slice(0, 22))}</span>${t.quote !== vn.quote ? ` <span class="tag">${esc(t.quote)}</span>` : ""}</td>`],
+    ["stage", "Stage", "", t => `<td>${esc(t.stage)}</td>`],
+    ["ageMin", "Age", "", t => `<td class="n">${fMin(t.ageMin)}</td>`],
+    ["mcapUsd", "Mcap", "", t => `<td class="n">${fK(t.mcapUsd)}</td>`],
+    ["progressPct", "Progress", "", t => `<td class="n">${t.progressPct == null ? "–" : fNum(t.progressPct, 0) + "%"}</td>`],
+    ["chg1m", "1m", "", t => chg(t.chg1m)], ["chg5m", "5m", "", t => chg(t.chg5m)], ["chg15m", "15m", "", t => chg(t.chg15m)],
+    ["tpm1", "Trades/min", "", t => `<td class="n">${t.tpm1 == null ? "–" : fNum(t.tpm1, 1)}</td>`],
+    ["vol1m", "Vol/min", "", t => `<td class="n">${t.vol1m == null ? "–" : fUsd(t.vol1m, 0)}</td>`],
+    ["buyRatio1m", "Buy share", tick, t => `<td class="n">${t.buyRatio1m == null ? "–" : fNum(t.buyRatio1m, 0) + "%"}</td>`],
+    ["netFlow1m", "Net flow", tick, t => `<td class="n ${cls(t.netFlow1m)}">${t.netFlow1m == null ? "–" : fSUsd(t.netFlow1m, 0)}</td>`],
+    ["buyers5m", "Buyers 5m", tick, t => `<td class="n">${t.buyers5m ?? "–"}</td>`],
+    ["whale1m", "Biggest buy", tick, t => `<td class="n">${t.whale1m == null ? "–" : fUsd(t.whale1m, 0)}</td>`],
+    ["volSpike", "Spike", tick, t => `<td class="n">${t.volSpike == null ? "–" : fNum(t.volSpike, 1) + "×"}</td>`],
+    ["devSoldUsd", "Creator sold", tick, t => `<td class="n ${t.devSoldUsd > 0 ? "neg" : ""}">${t.devSoldUsd == null ? "–" : fUsd(t.devSoldUsd, 0)}</td>`],
+    ["inflow1m", "Inflow 1m", "net buys into the curve", t => `<td class="n ${cls(t.inflow1m)}">${t.inflow1m == null ? "–" : fSUsd(t.inflow1m, 0)}</td>`],
+    ["inflow5m", "Inflow 5m", "net buys into the curve", t => `<td class="n ${cls(t.inflow5m)}">${t.inflow5m == null ? "–" : fSUsd(t.inflow5m, 0)}</td>`],
+    ["fillRate", "Speed", "curve progress per minute", t => `<td class="n">${t.fillRate == null ? "–" : fNum(t.fillRate, 1) + "%/m"}</td>`],
+    ["ddPeak", "Below peak", "", t => `<td class="n">${t.ddPeak == null ? "–" : fNum(t.ddPeak, 0) + "%"}</td>`],
+    ["athDdPct", "Below ATH", "", t => `<td class="n">${t.athDdPct == null ? "–" : fNum(t.athDdPct, 0) + "%"}</td>`],
+    ["live", "Live", "creator is livestreaming", t => `<td class="n">${t.live === "yes" ? "● live" : ""}</td>`],
+    ["mayhem", "Mayhem", "launched in Mayhem mode", t => `<td class="n">${t.mayhem === "yes" ? "mayhem" : ""}</td>`],
+    ["replies", "Replies", "", t => `<td class="n">${t.replies ?? "–"}</td>`],
+    ["creatorCoins", "Dev coins", "coins this creator launched in 24h", t => `<td class="n ${t.creatorCoins > 1 ? "neg" : ""}">${t.creatorCoins ?? "–"}</td>`],
+    ["tradeCount", "Trades", "", t => `<td class="n">${fNum(t.tradeCount, 0)}</td>`],
+    ["taxBps", "Tax", "", t => `<td class="n">${t.taxBps}</td>`],
+    ["socials", "Socials", "", t => `<td class="n">${t.socials}</td>`],
+    ["idleSec", "Idle", "", t => `<td class="n">${fDur(t.idleSec)}</td>`],
+    [null, "Universe", "", t => `<td>${t.inUniverse ? "✓ yes" : '<span class="dim">no</span>'}</td>`],
+    [null, "Held by", "", t => `<td class="n">${t.held || ""}</td>`],
+  ].filter(c => !off.has(c[0]));
+  const text = new Set(["Token", "Stage", "Universe"]);
+  $("#mktTbl").innerHTML = `<tr>${cols.map(([k, h, tip]) => `<th class="${text.has(h) ? "" : "n"}"${tip ? ` title="${tip}"` : ""}>${h}</th>`).join("")}</tr>` +
+    toks.map(t => `<tr>${cols.map(c => c[3](t)).join("")}</tr>`).join("");
 }
 
 // ---------- edge map ----------
@@ -107,6 +134,7 @@ const LAB_META = {
   minValTrades: ["Min trades (validation)", "#", "Validation trades needed before a genome can be a champion"],
   promoteCount: ["Champions per epoch", "#", "Validated genomes injected into live trading at each live epoch"],
   rebuildMin: ["Refresh data every", "min", "How often the recorded window is reloaded"],
+  candGapSec: ["Candidate spacing", "s", "At most one entry candidate per token this often, even while it trades every poll (saves memory on busy venues; 0 = every change)"],
   maxGensPerData: ["Generations per refresh", "#", "Pause after this many generations on the same data (more would only overfit it)"],
   folds: ["Training slices", "#", "The training data is cut into this many consecutive slices; genomes are rewarded for profiting in most of them"],
   minFoldShare: ["Champion: slices profitable", "0-1", "Share of training slices a champion must be profitable in"],
@@ -130,18 +158,30 @@ const POLL_META = {
 };
 const fld = (id, [l, u, h], v) => `<label data-tip="${esc(h)}">${esc(l)} <span class="u">${esc(u)}</span></label><input type="number" step="any" data-s="${id}" value="${v ?? ""}">`;
 const chk = (id, l, h, v) => `<label data-tip="${esc(h)}">${esc(l)}</label><input type="checkbox" data-s="${id}" ${v ? "checked" : ""}>`;
+// pump.fun wording for the fields whose meaning depends on the venue
+const PUMP_META = {
+  "execution.latencyMs": ["Latency", "ms", "Delay from the strategy seeing data to the transaction executing. Fills use the bonding curve read from Solana at that moment."],
+  "execution.gasUsd": ["Fee per tx", "$", "Solana base + priority fee (or tip), charged on every transaction including reverted ones"],
+  "execution.protocolFeeBps": ["Curve fee", "bps", "Bonding-curve fee on buys and sells: 0.95% protocol + 0.30% creator = 125"],
+  "execution.hookFeeBps": ["Graduated pool fee", "bps", "PumpSwap fee after graduation (dynamic; about 1.25% at low market caps)"],
+  "execution.gradLiquidityMult": ["Graduated depth ×", "", "Scales the modelled PumpSwap pool depth (seeded with the curve's closing price and 206.9M tokens)"],
+  "poll.intervalSec": ["Poll interval", "s", "How often the pump.fun lists (newest, curve and graduated coins by last trade) are fetched"],
+};
+const vmeta = (id, m) => (S.meta.venue.id === "pumpfun" && PUMP_META[id]) || m;
 function renderSettings() {
-  const c = S.state.cfg;
+  const c = S.state.cfg, pump = S.meta.venue.id === "pumpfun";
   $("#uniForm").innerHTML = filterForm(c.universe, "uni");
-  $("#exForm").innerHTML = Object.entries(EX_META).map(([k, m]) => fld("execution." + k, m, c.execution[k])).join("") +
-    chk("execution.useChainQuotes", "Fill on live on-chain quotes", "Off = fill from API data with the curve model (latency then has little effect)", c.execution.useChainQuotes);
+  $("#exForm").innerHTML = Object.entries(EX_META).map(([k, m]) => fld("execution." + k, vmeta("execution." + k, m), c.execution[k])).join("") +
+    (pump ? chk("execution.useChainQuotes", "Fill on live Solana state", "Each order reads the coin's bonding curve from Solana when it lands (graduated coins: a fresh pump.fun API read); off = fill on the last poll", c.execution.useChainQuotes)
+      : chk("execution.useChainQuotes", "Fill on live on-chain quotes", "Off = fill from API data with the curve model (latency then has little effect)", c.execution.useChainQuotes));
   $("#sizeForm").innerHTML = Object.entries(S.meta.sizing).map(([k, d]) => fld("sizing." + k, [d.label, d.unit, d.help], c.sizing[k])).join("");
   $("#evoForm").innerHTML = chk("evolution.enabled", "Evolution on", "Retire losers and breed winners every epoch", c.evolution.enabled) +
     Object.entries(EVO_META).map(([k, m]) => fld("evolution." + k, m, c.evolution[k])).join("") +
     chk("evolution.retireClones", "Retire clones", "Retire auto strategies that make exactly the same trades as an older one", c.evolution.retireClones);
   $("#labForm").innerHTML = chk("lab.enabled", "Lab on", "Run the genetic algorithm in the background on recorded data", c.lab.enabled) +
+    chk("lab.calibrateSlippage", "Charge live slippage", "Charge every simulated trade the slippage measured on live fills (signal spot vs fill), so the lab matches live results", c.lab.calibrateSlippage) +
     Object.entries(LAB_META).map(([k, m]) => fld("lab." + k, m, c.lab[k])).join("");
-  $("#pollForm").innerHTML = Object.entries(POLL_META).map(([k, m]) => { const [a, b] = k.split("."); return fld(k, m, c[a][b]); }).join("") +
+  $("#pollForm").innerHTML = Object.entries(POLL_META).filter(([k]) => !(pump && k === "poll.pages")).map(([k, m]) => { const [a, b] = k.split("."); return fld(k, vmeta(k, m), c[a][b]); }).join("") +
     chk("edge.enabled", "Edge map sampling", "Collect forward-return samples", c.edge.enabled) +
     chk("record.enabled", "Record snapshots", "Write every poll to data/snapshots for backtests", c.record.enabled);
   $("#setMsg").textContent = "";

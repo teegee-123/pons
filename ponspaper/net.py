@@ -57,6 +57,7 @@ class Client:
         self._proxy = self._detect_proxy()
         self.requests = 0
         self.errors = 0
+        self.error_kinds = {}  # "host status" -> count, so the dashboard can tell 404s from rate limiting
 
     @staticmethod
     def _detect_proxy():
@@ -115,6 +116,7 @@ class Client:
                     raise HttpError(r.status, "retryable")
                 if r.status >= 400:
                     self.errors += 1
+                    self._note(host, r.status)
                     raise HttpError(r.status)
                 return json.loads(raw)
             except HttpError as e:
@@ -124,9 +126,14 @@ class Client:
             except (OSError, http.client.HTTPException, ValueError) as e:
                 last = e
             self.errors += 1
+            self._note(host, getattr(last, "status", type(last).__name__))
             self._drop(host)
             time.sleep(0.2 * (attempt + 1))
         raise last
+
+    def _note(self, host, kind):
+        key = f"{host} {kind}"
+        self.error_kinds[key] = self.error_kinds.get(key, 0) + 1
 
     def get_json(self, url, headers=None):
         return self.request("GET", url, headers=headers)

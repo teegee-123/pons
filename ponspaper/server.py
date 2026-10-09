@@ -7,6 +7,8 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import venue as V
+
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 
 
@@ -56,13 +58,13 @@ def make_handler(engine):
             if p == "/health":
                 st = engine.status
                 fresh = st["lastPollAt"] is not None and time.time() - st["lastPollAt"] < 60
-                return self._send(200, {"ok": True, "polling": fresh, "polls": st["polls"]})
+                return self._send(200, {"ok": True, "venue": V.NAME, "polling": fresh, "polls": st["polls"]})
             if p == "/api/state":
                 return self._send(200, engine.state_view())
             if p == "/download/trades.csv":
-                return self._send(200, engine.store.trades_csv(), "text/csv; charset=utf-8", "pons_trades.csv")
+                return self._send(200, engine.store.trades_csv(), "text/csv; charset=utf-8", f"{V.FILE_PREFIX}_trades.csv")
             if p == "/download/snapshots.jsonl.gz":
-                return self._send(200, engine.store.snapshots_gz(), "application/gzip", "pons_snapshots.jsonl.gz")
+                return self._send(200, engine.store.snapshots_gz(), "application/gzip", f"{V.FILE_PREFIX}_snapshots.jsonl.gz")
             if p == "/api/meta":
                 return self._send(200, engine.meta())
             if p == "/api/lab":

@@ -1,13 +1,16 @@
 """Order execution with latency.
 
 LiveExecutor: each order waits `latencyMs` after the signal, then is quoted against live on-chain state (curve
-reserves or the v4 quoter) and checked against the slippage limit, like a real transaction with minOut.
+reserves or the v4 quoter) and checked against the slippage limit, like a real transaction with minOut. On
+pump.fun the live state is the coin's bonding curve / PumpSwap pool read from Solana (then a fresh pump.fun API
+read if Solana can't be reached).
 ReplayExecutor: for backtests on recorded data; fills at the first recorded snapshot at/after the due time.
 """
 import heapq
 import threading
 import time
 
+from . import venue as V
 from .sim import Venue, model_venue
 
 
@@ -84,15 +87,49 @@ class LiveExecutor:
         toks = [eng.market.get(o["addr"]) for o in orders]
         if ex.get("useChainQuotes", True) and eng.chain is not None:
             try:
-                self._chain_fill(orders, toks, results, ex)
+                (self._solana_fill if V.PUMP else self._chain_fill)(orders, toks, results, ex)
             except Exception as e:
-                self.last_error = f"chain quote failed, used model: {e!r}"
+                self.last_error = f"chain quote failed, used {'API' if V.PUMP else 'model'}: {e!r}"
+        if V.PUMP and ex.get("useChainQuotes", True) and None in results:
+            try:  # Solana unreadable for some coins: a fresh API read is the next best thing
+                self._api_fill(orders, results, ex)
+            except Exception as e:
+                self.last_error = f"fresh API read failed, used last poll: {e!r}"
         t = time.time()
         for i, o in enumerate(orders):
             if results[i] is None:
                 d = toks[i].d if toks[i] else None
                 results[i] = fill_with_venue(o, model_venue(d, ex) if d else None, d and d.get("quoteUsd"), ex, t)
         return results
+
+    def _solana_fill(self, orders, toks, results, ex):
+        """pump.fun: quote against the coin's bonding curve / PumpSwap pool as read from Solana right now."""
+        ds = {o["addr"]: toks[i].d for i, o in enumerate(orders) if toks[i] is not None}
+        t0 = time.time()
+        states = self.engine.chain.states(list(ds.values()))
+        t = self._read_time(t0)
+        for i, o in enumerate(orders):
+            d = ds.get(o["addr"])
+            st = states.get(d["address"]) if d else None
+            if st is None:  # graduated or unreadable: filled from a fresh API read instead
+                continue
+            v = Venue("curve", st["Q"], st["T"], st["sellable"], ex["protocolFeeBps"], d.get("creatorTaxBps") or 0,
+                      src="chain")
+            results[i] = fill_with_venue(o, v, d.get("quoteUsd"), ex, t)
+
+    def _api_fill(self, orders, results, ex):
+        """pump.fun: re-read the coins still unfilled from the API and fill on that curve / pool state."""
+        todo = [i for i, r in enumerate(results) if r is None]
+        t0 = time.time()
+        fresh = self.engine.fetch_fresh(list(dict.fromkeys(orders[i]["addr"] for i in todo)))
+        t = self._read_time(t0)
+        for i in todo:
+            o = orders[i]
+            d = fresh.get(o["addr"])
+            v = model_venue(d, ex) if d else None
+            if v is not None:
+                v.src = "api"
+                results[i] = fill_with_venue(o, v, d.get("quoteUsd"), ex, t)
 
     def _read_time(self, t0):
         rtt = time.time() - t0

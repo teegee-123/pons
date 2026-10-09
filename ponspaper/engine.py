@@ -1,4 +1,4 @@
-"""Paper-trading engine: polls pons, runs every strategy against the same live feed, fills with latency and
+"""Paper-trading engine: polls the venue (pons or pump.fun), runs every strategy against the same live feed, fills with latency and
 fees, and evolves the auto strategies so the profitable filter/exit combinations rise to the top."""
 import concurrent.futures
 import copy
@@ -11,8 +11,11 @@ import time
 from collections import deque
 from datetime import datetime
 
+from . import pumpfun
 from . import strategy as S
+from . import venue as V
 from .chain import Chain
+from .solana import SolanaChain, rpc_url as solana_rpc_url
 from .edge import EdgeMap
 from .execution import LiveExecutor, ReplayExecutor
 from .market import Market, socials_count, spot_usd
@@ -46,11 +49,11 @@ DEFAULT_CONFIG = {
                   "retireClones": True},
     "lab": DEFAULT_LAB,
     "edge": {"enabled": True, "sampleEverySec": 120, "horizonsMin": [1, 5, 15, 30], "sizeUsd": 50.0},
-    "record": {"enabled": True},
+    "record": {"enabled": True, "dedupeSec": 0},  # dedupeSec: skip a token's unchanged row for this long
     "ticks": {"enabled": True},
 }
 
-SEEDS = [
+PONS_SEEDS = [
     {"name": "Fresh momentum", "filters": {"ageMin": {"max": 10}, "chg1m": {"min": 5}, "tpm1": {"min": 3}, "mcapUsd": {"max": 12000}},
      "exits": {"tpPct": 40, "slPct": 20, "trailPct": 15, "trailArmPct": 20, "maxHoldMin": 15, "staleMin": 3}},
     {"name": "Mid-curve breakout", "filters": {"progressPct": {"min": 25, "max": 70}, "chg5m": {"min": 15}, "vol1m": {"min": 500}},
@@ -60,11 +63,14 @@ SEEDS = [
     {"name": "Graduation run", "filters": {"progressPct": {"min": 75}, "stage": {"in": ["curve"]}, "chg5m": {"min": 0}},
      "exits": {"tpPct": 35, "slPct": 15, "trailPct": None, "maxHoldMin": 30, "staleMin": 5}},
 ]
+SEEDS = pumpfun.SEEDS if V.PUMP else PONS_SEEDS
 
 TRADE_FEAT_COLS = ["ageMin", "mcapUsd", "progressPct", "chg1m", "chg5m", "tpm1", "vol1m", "ddPeak", "taxBps", "socials"]
 FEAT_KEEP = ["ageMin", "mcapUsd", "progressPct", "chg1m", "chg5m", "chg15m", "tpm1", "vol1m", "ddPeak", "tradeCount",
              "idleSec", "taxBps", "socials", "stage", "buyRatio1m", "netFlow1m", "buyers5m", "sellers5m", "whale1m",
              "volSpike", "devSoldUsd"]
+if V.PUMP:
+    FEAT_KEEP += ["inflow1m", "inflow5m", "fillRate", "athDdPct", "replies", "creatorCoins", "live", "mayhem"]
 
 
 def deep_merge(base, patch):
@@ -75,6 +81,10 @@ def deep_merge(base, patch):
         else:
             out[k] = copy.deepcopy(v)
     return out
+
+
+if V.PUMP:
+    DEFAULT_CONFIG = deep_merge(DEFAULT_CONFIG, pumpfun.CONFIG)
 
 
 def _iso(t):
@@ -151,19 +161,23 @@ class Engine:
         self.last_epoch = time.time()
         self.edge = EdgeMap(self.cfg["edge"], data_dir if live else None)
         self.status = {"startedAt": time.time(), "polls": 0, "pollErrors": 0, "lastPollAt": None, "lastPollMs": None,
-                       "lastError": None, "gaps": 0, "refreshes": 0, "ethUsd": None, "lastEquitySample": 0,
+                       "lastError": None, "gaps": 0, "refreshes": 0, "quoteUsd": None, "quote": V.QUOTE, "lastEquitySample": 0,
                        "tickErrors": 0, "tickGaps": 0, "tickLastError": None, "tickCount": 0}
         self.client = Client() if live else None
-        self.chain = Chain(self.client, self.cfg["rpcUrl"], self.cfg["apiBase"]) if live else None
-        self.tickfeed = TickFeed(self.client, self.cfg["rpcUrl"], self.cfg["apiBase"]) if live else None
+        if live and V.PUMP:  # Solana reads for fills and open positions; no tick feed yet
+            self.chain, self.tickfeed = SolanaChain(self.client, solana_rpc_url()), None
+        else:  # Robinhood Chain: fill quotes and the tick feed
+            self.chain = Chain(self.client, self.cfg["rpcUrl"], self.cfg["apiBase"]) if live else None
+            self.tickfeed = TickFeed(self.client, self.cfg["rpcUrl"], self.cfg["apiBase"]) if live else None
         self.executor = LiveExecutor(self) if live else ReplayExecutor(self)
-        self._prev_newest_trade = None
+        self._prev_newest_trade = {}  # per list sorted by last trade: newest trade seen in the previous poll
         self._dirty = set()
         self._last_save = time.time()
         self._rec_buf = []
         self._rec_meta = set()
         self._rec_file = None
-        self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=4) if live else None
+        self._rec_last = {}  # addr -> (last recorded row, time), for record.dedupeSec
+        self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=8 if V.PUMP else 4) if live else None
         self.lab = Lab(self.cfg, random.Random(seed)) if live else None
         self._lab_rebuild = True
         if live and not fresh:
@@ -270,6 +284,8 @@ class Engine:
                 stale = lab.ds is None or time.time() - lab.ds.built_at > lc["rebuildMin"] * 60
                 if self._lab_rebuild or stale:
                     self._lab_rebuild = False
+                    with self.lock:
+                        lab.slip, lab.slip_n = self.live_slippage()
                     since = time.time() - lc["windowHours"] * 3600
                     lab.build(snapshot_records(self.store.snapshot_lines(since)), yield_every=(1.0 - duty) / duty * 0.25)
                     lab.last_error = None
@@ -298,6 +314,22 @@ class Engine:
                 self._lab_rebuild = True
                 self.stopping.wait(60)
 
+    def live_slippage(self, min_fills=20):
+        """-> (per-side cost as a fraction, fills used): how much worse live fills were than the spot each strategy
+        saw at its signal, averaged over buys and sells (middle 80%, so a few wild fills don't dominate). Never
+        negative: luckier-than-signal fills don't make the lab more optimistic."""
+        def trimmed_mean(xs):
+            xs = sorted(xs)
+            cut = len(xs) // 10
+            xs = xs[cut: len(xs) - cut] or xs
+            return sum(xs) / len(xs) if xs else 0.0
+        buys = [f["drift"] for f in self.fills if f["ok"] and f["side"] == "buy" and f.get("drift") is not None]
+        sells = [f["drift"] for f in self.fills if f["ok"] and f["side"] == "sell" and f.get("drift") is not None]
+        if len(buys) + len(sells) < min_fills:
+            return 0.0, len(buys) + len(sells)
+        per_side = (trimmed_mean(buys) if buys else 0.0) / 2 - (trimmed_mean(sells) if sells else 0.0) / 2
+        return min(0.2, max(0.0, per_side)), len(buys) + len(sells)
+
     def stop(self):
         self.stopping.set()
         self._flush_recording(force=True)
@@ -320,10 +352,13 @@ class Engine:
             self._flush_recording()
             self.stopping.wait(max(0.2, float(self.cfg["poll"]["intervalSec"]) - (time.time() - t0)))
 
-    def _poll(self):
+    def _fetch_lists(self):
+        """-> (items, cover, errors). cover: [(list, lastTradeAt times, full page)] for each list ordered by last
+        trade; errors: lists that failed while others worked."""
+        if V.PUMP:
+            return pumpfun.fetch_lists(self.client, self.cfg, self._pool)
         base = self.cfg["apiBase"].rstrip("/")
         pc = self.cfg["poll"]
-        tick_fut = self._pool.submit(self.tickfeed.fetch) if self.cfg["ticks"].get("enabled", True) else None
         items, cursor = [], None
         for _ in range(max(1, int(pc["pages"]))):
             url = f"{base}/api/launches?sort={pc['sort']}" + (f"&cursor={cursor}" if cursor else "")
@@ -332,27 +367,87 @@ class Engine:
             cursor = page.get("nextCursor")
             if not cursor:
                 break
-        listed = {(d.get("address") or "").lower() for d in items}
         lts = [d.get("lastTradeAt") or 0 for d in items]
+        return items, [("active", lts, len(items) >= 40 * max(1, int(pc["pages"])))], []
+
+    def _fetch_one(self, addr):
+        if V.PUMP:
+            return pumpfun.fetch_coin(self.client, self.cfg, addr)
+        return self.client.get_json(f"{self.cfg['apiBase'].rstrip('/')}/api/launches/{addr}")
+
+    def fetch_fresh(self, addrs, timeout=10):
+        """Re-read tokens from the API right now (pump.fun fills) -> {addr: token dict}."""
+        futs = {a: self._pool.submit(self._fetch_one, a) for a in addrs}
+        out = {}
+        for a, fut in futs.items():
+            try:
+                d = fut.result(timeout=timeout)
+                if isinstance(d, dict) and d.get("address"):
+                    out[a] = d
+            except Exception:
+                pass
+        return out
+
+    def _chain_marks(self):
+        """pump.fun: the bonding curves of held coins and of coins the edge map is about to value, read from Solana
+        -> {addr: (token dict, state)}, so exits and edge samples use live chain state (at most 2 RPC calls). Never
+        raises: what Solana can't answer falls back to API refreshes."""
+        with self.lock:
+            held = self._held_addrs()
+            want = list(held) + [a for a in self.edge.due_addrs(time.time(), self.market) if a not in held]
+            ds = [tok.d for a in want if (tok := self.market.get(a)) is not None][:200]
+        if not ds:
+            return {}
+        try:
+            states = self.chain.states(ds)
+        except Exception as e:
+            self.status["lastError"] = f"{_iso(time.time())} Solana read failed: {e!r}"
+            return {}
+        return {V.addr_key(d["address"]): (d, states[d["address"]]) for d in ds if d["address"] in states}
+
+    def _poll(self):
+        pc = self.cfg["poll"]
+        tick_fut = (self._pool.submit(self.tickfeed.fetch)
+                    if self.tickfeed is not None and self.cfg["ticks"].get("enabled", True) else None)
+        chain_fut = self._pool.submit(self._chain_marks) if V.PUMP and self.chain is not None else None
+        items, cover, list_errors = self._fetch_lists()
+        if list_errors:
+            self.status["lastError"] = f"{_iso(time.time())} {'; '.join(list_errors)}"
+        listed = {V.addr_key(d.get("address")) for d in items}
+        marked = chain_fut.result() if chain_fut is not None else {}
+        if marked:  # chain state on top of the newest API data for each held coin
+            now = time.time()
+            items = [pumpfun.apply_state(d, marked[a][1], now) if (a := V.addr_key(d.get("address"))) in marked else d
+                     for d in items]
+            items += [pumpfun.apply_state(d, st, now) for a, (d, st) in marked.items() if a not in listed]
+        fresh = listed | set(marked)
         with self.lock:
             now = time.time()
             held = self._held_addrs()
-            # The list is ordered by last trade, so a token missing from it hasn't traded since we last saw it --
-            # unless the oldest listed trade is newer than the newest one from the previous poll (a coverage gap).
-            if lts and self._prev_newest_trade is not None and len(items) >= 40 * max(1, int(pc["pages"])):
-                if min(lts) > self._prev_newest_trade:
-                    self.status["gaps"] += 1
-                    self._dirty |= held | self.edge.due_addrs(now, self.market)
-            if lts:
-                self._prev_newest_trade = max(lts)
+            # A list ordered by last trade misses a token only if it hasn't traded since we last saw it -- unless
+            # the oldest listed trade is newer than the newest one from the previous poll (a coverage gap).
+            gap = False
+            for key, lts, full in cover:
+                prev = self._prev_newest_trade.get(key)
+                if lts and prev is not None and full and min(lts) > prev:
+                    gap = True
+                if lts:
+                    self._prev_newest_trade[key] = max(lts)
+            if gap:
+                self.status["gaps"] += 1
+                self._dirty |= held | self.edge.due_addrs(now, self.market)
             for a in held:
                 tok = self.market.get(a)
-                if a not in listed and (tok is None or now - tok.updated > pc["heldRefreshSec"]):
+                if a not in fresh and (tok is None or now - tok.updated > pc["heldRefreshSec"]):
                     self._dirty.add(a)
-            self._dirty |= {a for a in self.edge.due_addrs(now, self.market) if a not in listed}
-            todo = [a for a in self._dirty if a not in listed][: int(pc["refreshCap"])]
+            self._dirty |= {a for a in self.edge.due_addrs(now, self.market) if a not in fresh}
+
+            def stale_first(a):  # held positions first, then whatever was updated longest ago
+                tok = self.market.get(a)
+                return (a not in held, tok.updated if tok else 0.0)
+            todo = sorted((a for a in self._dirty if a not in fresh), key=stale_first)[: int(pc["refreshCap"])]
         if todo:
-            futs = {self._pool.submit(self.client.get_json, f"{base}/api/launches/{a}"): a for a in todo}
+            futs = {self._pool.submit(self._fetch_one, a): a for a in todo}
             for fut, a in futs.items():
                 try:
                     d = fut.result(timeout=15)
@@ -365,7 +460,7 @@ class Engine:
                         self._dirty.discard(a)
                 except Exception:
                     pass
-        for a in listed:
+        for a in fresh:
             self._dirty.discard(a)
         tick_res = None
         if tick_fut is not None:
@@ -402,15 +497,20 @@ class Engine:
                 if tick_gap:
                     self.market.start_ticks(now)
                 self.market.add_tick_rows(tick_rows, now)
-            self._record(items, now, rec_ticks, live_ticks is not None and (live_ticks[1] or not live_ticks[2]))
+            feats = {t.addr: t.features(now) for t in toks}
+            rec_items = items
+            if self.live and self.cfg["record"].get("universeOnly"):  # only what the lab and replays can use
+                uni, held = self.cfg["universe"], self._held_addrs()
+                rec_items = [d for d in items if (a := V.addr_key(d.get("address"))) in held
+                             or (a in feats and S.passes(uni, feats[a]))]
+            self._record(rec_items, now, rec_ticks, live_ticks is not None and (live_ticks[1] or not live_ticks[2]))
             if not self.live:
                 self.executor.process(now)
             ex = self.cfg["execution"]
             for d in items:
-                if (d.get("quote") or {}).get("symbol") == "ETH" and d.get("quoteUsd"):
-                    self.status["ethUsd"] = d["quoteUsd"]
+                if (d.get("quote") or {}).get("symbol") == V.QUOTE and d.get("quoteUsd"):
+                    self.status["quoteUsd"] = d["quoteUsd"]
                     break
-            feats = {t.addr: t.features(now) for t in toks}
             self._exits(now, ex)
             cands = [t for t in toks if listed is None or t.addr in listed]
             self._entries(cands, feats, now, ex)
@@ -424,7 +524,7 @@ class Engine:
                 self.evolve(now)
             if self.status.get("lastPrune", 0) < now - 300:
                 self.status["lastPrune"] = now
-                self.market.prune(now, self._held_addrs())
+                self.market.prune(now, self._held_addrs(), V.FORGET_IDLE_SEC)
 
     def _entries(self, cands, feats, now, ex):
         uni = self.cfg["universe"]
@@ -719,22 +819,37 @@ class Engine:
     def _record(self, items, now, tick_rows=None, tick_gap=False):
         if not self.live or not self.cfg["record"]["enabled"]:
             return
+        dedupe = float(self.cfg["record"].get("dedupeSec") or 0)
         rows = []
         for d in items:
-            a = (d.get("address") or "").lower()
+            a = V.addr_key(d.get("address"))
             if not a:
                 continue
             if a not in self._rec_meta:
                 self._rec_meta.add(a)
-                self._rec_buf.append(json.dumps({"m": {k: d.get(k) for k in (
-                    "address", "symbol", "name", "createdAt", "thresholdQuote", "creatorTaxBps", "buybackEnabled",
-                    "curve", "factory", "decimals", "deployer")} | {"quote": d.get("quote"), "socials": d.get("socials")}},
-                    separators=(",", ":")))
-            rows.append([a, d.get("stage"), d.get("lastTradeAt"), d.get("raisedQuote"), d.get("priceQuote"),
-                         d.get("priceUsd"), d.get("marketCapUsd"), d.get("volumeUsd"), d.get("tradeCount"),
-                         d.get("progress"), d.get("quoteUsd"), d.get("graduatedAt")])
+                if V.PUMP:
+                    m = pumpfun.record_meta(d)
+                else:
+                    m = {k: d.get(k) for k in (
+                        "address", "symbol", "name", "createdAt", "thresholdQuote", "creatorTaxBps", "buybackEnabled",
+                        "curve", "factory", "decimals", "deployer")} | {"quote": d.get("quote"), "socials": d.get("socials")}
+                self._rec_buf.append(json.dumps({"m": m}, separators=(",", ":")))
+            if V.PUMP:
+                row = pumpfun.record_row(d)  # compact: curve reserves; the rest is derived on replay
+            else:
+                row = [a, d.get("stage"), d.get("lastTradeAt"), d.get("raisedQuote"), d.get("priceQuote"),
+                       d.get("priceUsd"), d.get("marketCapUsd"), d.get("volumeUsd"), d.get("tradeCount"),
+                       d.get("progress"), d.get("quoteUsd"), d.get("graduatedAt")]
+            if dedupe:
+                last = self._rec_last.get(a)
+                if last and last[0] == row and now - last[1] < dedupe:
+                    continue
+                self._rec_last[a] = (row, now)
+            rows.append(row)
+        if dedupe and len(self._rec_last) > 5000:
+            self._rec_last = {a: v for a, v in self._rec_last.items() if now - v[1] < dedupe}
         if rows or tick_rows is not None or tick_gap:
-            rec = {"t": round(now, 2), "u": rows}
+            rec = {"t": round(now, 2), "v" if V.PUMP else "u": rows}
             if tick_rows is not None:
                 rec["x"] = tick_rows   # trades since the previous poll (present, possibly empty, while the feed works)
             if tick_gap:
@@ -775,7 +890,8 @@ class Engine:
                       storageError=getattr(self.store, "last_error", None),
                       executorError=self.executor.last_error,
                       chainCalls=self.chain.calls if self.chain else 0, chainFailures=self.chain.failures if self.chain else 0,
-                      httpRequests=self.client.requests if self.client else 0, httpErrors=self.client.errors if self.client else 0)
+                      httpRequests=self.client.requests if self.client else 0, httpErrors=self.client.errors if self.client else 0,
+                      httpErrorKinds=dict(sorted(self.client.error_kinds.items(), key=lambda kv: -kv[1])[:6]) if self.client else {})
             tot = lambda xs, key: sum(x[key] or 0 for x in xs)
             return {"status": st, "cfg": self.cfg, "rows": rows,
                     "totals": {"manualPnl": tot(man, "pnl"), "manualRealized": tot(man, "realized"),
@@ -828,7 +944,9 @@ class Engine:
             return self.edge.view(h_idx)
 
     def meta(self):
-        return {"filters": {k: {"label": v[0], "unit": v[1], "kind": v[2], "help": v[3], "options": S.ENUM_OPTIONS.get(k)}
+        return {"venue": {"id": V.NAME, "label": V.LABEL, "quote": V.QUOTE, "tokenUrl": V.TOKEN_URL,
+                          "unavailable": sorted(V.UNAVAILABLE)},
+                "filters": {k: {"label": v[0], "unit": v[1], "kind": v[2], "help": v[3], "options": S.ENUM_OPTIONS.get(k)}
                             for k, v in S.FILTERS.items()},
                 "exits": {k: {"label": v[0], "unit": v[1], "help": v[2]} for k, v in S.EXIT_FIELDS.items()},
                 "sizing": {k: {"label": v[0], "unit": v[1], "help": v[2]} for k, v in S.SIZING_FIELDS.items()},
@@ -837,7 +955,7 @@ class Engine:
     # ------------------------------------------------------------------ mutations from the dashboard
     def update_settings(self, patch):
         with self.lock:
-            allowed = {"poll", "execution", "universe", "sizing", "evolution", "edge", "record"}
+            allowed = {"poll", "execution", "universe", "sizing", "evolution", "edge", "record", "lab"}
             patch = {k: v for k, v in (patch or {}).items() if k in allowed}
             if "universe" in patch:
                 patch["universe"] = S.clean_filters(patch["universe"])
@@ -974,7 +1092,8 @@ def snapshot_items(paths):
 
 def snapshot_records(lines):
     """Yield (t, items, ticks, tick_gap) from recorded snapshot lines. ticks is None when the trade feed wasn't
-    running for that poll. Token metadata carries across files, so rows near an hour boundary aren't dropped."""
+    running for that poll. Token metadata carries across files, so rows near an hour boundary aren't dropped.
+    Rows are pons rows ("u") or compact pump.fun rows ("v")."""
     meta = {}
     for line in lines:
         line = line.strip()
@@ -986,7 +1105,7 @@ def snapshot_records(lines):
             continue
         if "m" in rec:
             m = rec["m"]
-            meta[(m.get("address") or "").lower()] = m
+            meta[V.addr_key(m.get("address"))] = m
             continue
         items = []
         for row in rec.get("u", []):
@@ -999,4 +1118,8 @@ def snapshot_records(lines):
              d["volumeUsd"], d["tradeCount"], d["progress"], d["quoteUsd"], d["graduatedAt"]) = row[1:12]
             d["address"] = a
             items.append(d)
+        for row in rec.get("v", []):
+            m = meta.get(row[0])
+            if m is not None:
+                items.append(pumpfun.expand_row(row, m))
         yield rec["t"], items, rec.get("x"), bool(rec.get("xg"))

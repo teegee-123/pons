@@ -39,11 +39,20 @@ class Venue:
 
 
 def model_venue(d, ex):
-    """Venue estimated from API data. Curve: exact virtual-reserve model (k = 0.4*threshold*1e9).
-    Graduated: constant-product approximation of the v4 pool seeded with `threshold` quote at graduation."""
+    """Venue estimated from API data. Curve: exact virtual-reserve model (k = 0.4*threshold*1e9), or the
+    reserves themselves when the API gives them (pump.fun). Graduated: constant-product approximation of the
+    pool seeded at graduation (`poolK` from pump.fun, or `threshold` quote on pons)."""
     thr = d.get("thresholdQuote") or 0
     tax = d.get("creatorTaxBps") or 0
     p = d.get("priceQuote")
+    if d.get("stage") != "graduated" and d.get("reserves"):
+        q, t, sellable = d["reserves"]
+        if q and t:
+            return Venue("curve", q, t, max(0.0, sellable or 0.0), ex["protocolFeeBps"], tax)
+    if d.get("stage") == "graduated" and d.get("poolK") and p:
+        mult = max(0.05, float(ex.get("gradLiquidityMult", 1.0)))
+        kp = d["poolK"] * mult * mult
+        return Venue("pool", math.sqrt(kp * p), math.sqrt(kp / p), float("inf"), ex["hookFeeBps"], tax)
     if thr <= 0:
         return None
     v0, k = curve_params(thr)

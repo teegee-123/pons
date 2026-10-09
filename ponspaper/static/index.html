@@ -104,7 +104,7 @@ a { color: var(--accent); text-decoration: none; }
 </head>
 <body>
 <header>
-  <h1>pons paper trader</h1>
+  <h1 id="appTitle">pons paper trader</h1>
   <span class="pill"><span class="dot" id="liveDot"></span><span id="liveTxt">connecting…</span></span>
   <div class="kpis" id="kpis"></div>
   <div class="spacer"></div>
@@ -211,7 +211,7 @@ a { color: var(--accent); text-decoration: none; }
     <div class="card"><h2>Backtest on recorded data</h2>
       <p class="help">The live trader records every poll. Replay the recording to evolve a large population in seconds (fills at the first recorded snapshot after the latency, model pricing):</p>
       <p><code>python -m ponspaper replay --population 200</code></p>
-      <p class="help">When running on a server (e.g. Render), download the recording and replay it on your own PC: <a class="btn" href="/download/snapshots.jsonl.gz" download>Download recording</a> then <code>python -m ponspaper replay pons_snapshots.jsonl.gz</code></p>
+      <p class="help">When running on a server (e.g. Render), download the recording and replay it on your own PC: <a class="btn" href="/download/snapshots.jsonl.gz" download>Download recording</a> then <code id="replayCmd">python -m ponspaper replay pons_snapshots.jsonl.gz</code></p>
       <p class="help">Results appear below. <b>Adopt</b> copies a strategy into the live paper trader as a manual strategy so it is tested forward on fresh data, which is the real test against overfitting.</p>
       <div id="btMeta" class="dim"></div>
       <div class="tablewrap"><table id="btTbl"></table></div></div>

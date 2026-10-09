@@ -7,6 +7,7 @@ feature bucket shows which conditions have had positive expectancy after costs.
 import json
 import os
 
+from . import venue as V
 from .sim import liquidation_usd, model_venue
 
 BUCKETS = {
@@ -29,7 +30,14 @@ BUCKETS = {
     "whale1m":     [1, 100, 300, 1000],
     "volSpike":    [1, 2, 4, 8],
     "devSoldUsd":  [1, 50],
+    "inflow1m":    [-200, 0, 200, 1000],
+    "inflow5m":    [-500, 0, 500, 2500],
+    "fillRate":    [1, 3, 10, 30],
+    "athDdPct":    [10, 30, 50, 75],
+    "replies":     [1, 5, 20],
+    "creatorCoins": [2, 3, 5],
 }
+BUCKETS = {k: v for k, v in BUCKETS.items() if k not in V.UNAVAILABLE}
 GRID = ("ageMin", "mcapUsd")
 
 

@@ -3,6 +3,8 @@ import bisect
 import math
 from collections import deque
 
+from . import venue as V
+
 TOKEN_SUPPLY = 1e9
 CURVE_V0_RATIO = 0.4   # virtual quote reserve at launch = 0.4 x graduation threshold (on-chain: 1.68 ETH vs 4.2 ETH)
 HIST_SEC = 1800        # keep 30 minutes of samples per token
@@ -19,6 +21,14 @@ def curve_params(threshold):
 def socials_count(d):
     s = d.get("socials") or {}
     return sum(1 for v in s.values() if v)
+
+
+def launch_price_quote(d):
+    """Price at launch, in quote units: given by the venue (pump.fun) or derived from the pons curve threshold."""
+    if d.get("launchPriceQuote"):
+        return d["launchPriceQuote"]
+    thr = d.get("thresholdQuote") or 0
+    return curve_params(thr)[0] / TOKEN_SUPPLY if thr > 0 else None
 
 
 def spot_quote(d):
@@ -48,31 +58,31 @@ def spot_usd(d):
 
 class Token:
     __slots__ = ("addr", "d", "first_seen", "updated", "hist", "_t", "_peak", "_peak_t",
-                 "ticks", "tick_since", "dev_sold", "dev")
+                 "ticks", "tick_since", "dev_sold", "dev", "peers")
 
     def __init__(self, addr, d, now):
         self.addr = addr
         self.d = d
         self.first_seen = now
         self.updated = now
-        self.hist = []   # (t, spot_usd, volume_usd, trade_count)
+        self.hist = []   # (t, spot_usd, volume_usd, trade_count, raised_quote)
         self._t = []     # parallel list of t for bisect
         self._peak, self._peak_t = 0.0, 0.0  # running max of spot over the history window
         self.ticks = deque()                   # (t, side, usd, wallet)
         self.tick_since = math.inf             # trades are known completely from this time on
         self.dev_sold = 0.0                    # USD the creator has sold (since we started watching)
         self.dev = (d.get("deployer") or "").lower()[2:18]
+        self.peers = None                      # pump.fun: {token: createdAt} of every launch by the same creator
         created = d.get("createdAt") or now
-        thr = d.get("thresholdQuote") or 0
-        if d.get("stage") != "graduated" and thr > 0 and now - created < HIST_SEC and d.get("quoteUsd"):
-            v0, k = curve_params(thr)
-            self._push(created, (v0 / TOKEN_SUPPLY) * d["quoteUsd"], 0.0, 0)
+        launch = launch_price_quote(d)
+        if d.get("stage") != "graduated" and launch and now - created < HIST_SEC and d.get("quoteUsd"):
+            self._push(created, launch * d["quoteUsd"], 0.0, 0, 0.0)
         self._sample(now)
 
-    def _push(self, t, px, vol, trades):
+    def _push(self, t, px, vol, trades, raised=None):
         if self._t and t < self._t[-1]:
             return
-        self.hist.append((t, px, vol, trades))
+        self.hist.append((t, px, vol, trades, raised))
         self._t.append(t)
         if px >= self._peak:
             self._peak, self._peak_t = px, t
@@ -82,10 +92,14 @@ class Token:
         px = spot_usd(d)
         if px is None:
             return
-        self._push(now, px, d.get("volumeUsd") or 0.0, d.get("tradeCount") or 0)
+        self._push(now, px, d.get("volumeUsd") or 0.0, d.get("tradeCount") or 0, d.get("raisedQuote"))
 
     def update(self, d, now):
         old = self.d
+        if old.get("socials") and set(old["socials"]) - set(d.get("socials") or {}):
+            d["socials"] = {**old["socials"], **(d.get("socials") or {})}  # a partial payload keeps known links
+        if d.get("mayhem") is None and old.get("mayhem") is not None:
+            d["mayhem"] = old["mayhem"]
         changed = (d.get("lastTradeAt") != old.get("lastTradeAt") or d.get("raisedQuote") != old.get("raisedQuote")
                    or d.get("priceQuote") != old.get("priceQuote") or d.get("stage") != old.get("stage"))
         self.d = d
@@ -172,18 +186,20 @@ class Token:
             "taxBps": d.get("creatorTaxBps") or 0,
             "socials": socials_count(d),
             "stage": d.get("stage"),
-            "quote": "ETH" if (d.get("quote") or {}).get("symbol") == "ETH" else "OTHER",
+            "quote": V.QUOTE if (d.get("quote") or {}).get("symbol") == V.QUOTE else "OTHER",
             "buyback": "yes" if d.get("buybackEnabled") else "no",
             "spotUsd": px,
         }
         if px and f["mcapUsd"] is None:
             f["mcapUsd"] = px * TOKEN_SUPPLY
-        vol, trades = d.get("volumeUsd") or 0.0, d.get("tradeCount") or 0
+        vol, trades = d.get("volumeUsd"), d.get("tradeCount")
+        flow = vol is not None or trades is not None  # pump.fun reports neither: leave the rates empty
+        vol, trades = vol or 0.0, trades or 0
         for key, win in (("chg1m", 60), ("chg5m", 300), ("chg15m", 900)):
             h = self.at(now - win)
             f[key] = (px / h[1] - 1.0) * 100.0 if (h and px and h[1]) else None
         h = self.at(now - 60)
-        if h:
+        if h and flow:
             span = max(1.0, now - h[0]) / 60.0
             f["tpm1"] = (trades - h[3]) / span
             f["vol1m"] = (vol - h[2]) / span
@@ -195,7 +211,28 @@ class Token:
         else:
             f["ddPeak"] = None
         f.update(self.tick_features(now))
+        if V.PUMP:
+            f.update(self.pump_features(now, f))
         return f
+
+    def pump_features(self, now, f):
+        """Signals built from pump.fun data (venue.PUMP_ONLY)."""
+        d = self.d
+        out = {}
+        curve = d.get("stage") != "graduated"
+        raised, qu = d.get("raisedQuote"), d.get("quoteUsd")
+        for key, win in (("inflow1m", 60), ("inflow5m", 300)):  # net buys: growth of the curve's real reserves
+            h = self.at(now - win)
+            out[key] = (raised - h[4]) * qu if curve and h and raised is not None and h[4] is not None and qu else None
+        prog, age = f.get("progressPct"), f.get("ageMin")
+        out["fillRate"] = prog / max(0.25, age) if curve and prog is not None and age is not None else None
+        ath, mc = d.get("athMcapUsd"), f.get("mcapUsd")
+        out["athDdPct"] = max(0.0, (1.0 - mc / ath) * 100.0) if ath and mc else None
+        out["replies"] = d.get("replies")
+        out["live"] = None if d.get("isLive") is None else ("yes" if d["isLive"] else "no")
+        out["mayhem"] = None if d.get("mayhem") is None else ("yes" if d["mayhem"] else "no")
+        out["creatorCoins"] = sum(1 for c in self.peers.values() if c >= now - 86400) if self.peers is not None else None
+        return out
 
 
 class Market:
@@ -204,11 +241,12 @@ class Market:
         self.by_curve = {}      # curve contract -> token address
         self.tick_start = None  # when the trade feed started (or last restarted after a gap)
         self._pending = deque()  # trades for curves we haven't seen in the launch list yet
+        self.creators = {}       # pump.fun: creator wallet -> {token: createdAt}
 
     def ingest(self, items, now):
         seen = []
         for d in items:
-            addr = (d.get("address") or "").lower()
+            addr = V.addr_key(d.get("address"))
             if not addr:
                 continue
             t = self.tokens.get(addr)
@@ -216,9 +254,12 @@ class Market:
                 t = self.tokens[addr] = Token(addr, d, now)
                 if self.tick_start is not None:
                     t.tick_since = max(self.tick_start, d.get("createdAt") or 0)
+                if V.PUMP and d.get("deployer"):
+                    t.peers = self.creators.setdefault(d["deployer"], {})
+                    t.peers[addr] = d.get("createdAt") or now
             else:
                 t.update(d, now)
-            if d.get("curve"):
+            if d.get("curve") and not V.PUMP:  # curve -> token, for the pons tick feed
                 self.by_curve[d["curve"].lower()] = addr
             seen.append(t)
         return seen
@@ -271,6 +312,13 @@ class Market:
     def prune(self, now, keep, max_idle=7200):
         for a in [a for a, t in self.tokens.items() if now - t.updated > max_idle and a not in keep]:
             del self.tokens[a]
+        cut = now - 86400
+        for dev in list(self.creators):  # launches older than a day no longer count
+            peers = self.creators[dev]
+            for a in [a for a, c in peers.items() if c < cut]:
+                del peers[a]
+            if not peers:
+                del self.creators[dev]
 
 
 def finite(x):

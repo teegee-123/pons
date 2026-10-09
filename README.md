@@ -11,6 +11,9 @@ python -m ponspaper replay     # backtest + evolve on recorded data (data/snapsh
 Needs Python 3.10+ only (no packages). The corporate proxy is picked up from `HTTPS_PROXY`, or from the
 Windows PAC script. Set `PONS_PROXY=host:port` to override.
 
+The same code can trade **pump.fun** instead: set `PONS_VENUE=pumpfun` (see [pump.fun](#pumpfun) below). Without
+it, everything runs on pons exactly as before.
+
 ## How fills are simulated
 
 | Cost | How it is modelled |
@@ -88,6 +91,66 @@ Limitations:
 - **Backtest:** `replay` runs a large population over the recorded snapshots in seconds. Adopt the best results
   back into live paper trading to test them forward on fresh data.
 
+## pump.fun
+
+`PONS_VENUE=pumpfun` (or double-click `run-pumpfun.bat` -> http://127.0.0.1:8788) runs a separate pump.fun paper
+trader: its own data folder (`%LOCALAPPDATA%\ponspaper\data-pumpfun`), its own Postgres tables (`pump_*`), its
+own starter strategies and search space. The dashboard, evolution, genetic lab, edge map and backtests all work the
+same way.
+
+**Data.** Every 2 seconds it polls three pump.fun lists in parallel: newest launches
+(`frontend-api-v3.pump.fun/coins?limit=60`), bonding-curve coins by last trade, and graduated coins by last
+trade. pump.fun launches about 50 coins a minute and a page covers only ~2 seconds of trading, so coins that
+slip through are re-read with `/coins-v2/{mint}`.
+
+**Fills read Solana.** When an order lands (`latencyMs` after the signal), the coin's bonding-curve account is
+read from Solana and the trade is quoted on those exact reserves: constant product on the virtual reserves, with
+the fees the program charges. Both were checked against real on-chain trades, which this maths reproduces to the
+token. Open positions are re-read from Solana every poll as well, so take profit / stop loss act on live chain
+state. The pump.fun API can lag a busy coin by several percent; the chain can't.
+
+| Cost | How it is modelled on pump.fun |
+|---|---|
+| Curve fee | 1.25% on buys and sells (0.95% protocol + 0.30% creator, read from on-chain trade events) |
+| Graduated (PumpSwap) | 1.25% by default. The real fee is tiered by market cap (about 1.15% at $200k, 0.3% above $20M) |
+| Solana fee | $0.05 per transaction (base + priority fee), reverted ones included |
+| Latency, slippage limits | as on pons |
+
+Set `SOLANA_RPC_URL` to a private RPC (a free Helius or QuickNode endpoint) for reliability; without it the
+public `api.mainnet-beta.solana.com` is used, which rate-limits and may refuse some cloud servers. If Solana
+can't be read, fills fall back to a fresh pump.fun API read (`api` in the Fills table), then to the last poll
+(`model`). The RPC URL is never saved in the config or shown on the dashboard.
+
+**Signals.** pump.fun's API has no lifetime volume or trade count and there is no tick feed yet, so *Trades/min*,
+*Vol/min*, *Lifetime volume/trades*, *Creator tax*, *Buyback* and the seven tick signals are hidden. In their place:
+
+| Signal | Meaning |
+|---|---|
+| Net inflow 1m / 5m | buys minus sells into the curve, USD (growth of its real SOL reserves) |
+| Curve speed | curve progress per minute since launch |
+| Below ATH | how far market cap is below pump.fun's all-time high for the coin |
+| Livestream | the creator is streaming on pump.fun right now |
+| Replies | comments on the coin's page |
+| Creator's coins 24h | coins the same wallet launched in the last day (serial launchers), counted since start-up |
+
+**Genetic lab.** Trains on the last 2 hours, with at most one entry candidate per coin every 6 seconds
+(*Candidate spacing*), which keeps it near 120 MB of memory on a 512 MB server. Recorded snapshots can't show how
+far a price moves between a signal and its fill, but live fills do: with *Charge live slippage* on (the pump.fun
+default), the lab charges every simulated trade the per-side slippage measured on recent live fills, so its
+results line up with live trading.
+
+**Recording.** Only coins in the trading universe (plus anything held) are recorded, in a compact form (curve
+reserves; price, market cap and progress are derived again on replay), and unchanged rows are skipped for 60 s.
+
+Limitations:
+- Graduated coins are not read from Solana. PumpSwap swaps don't follow constant product on the pool's vault
+  balances (checked against real swaps), so they fill on a fresh pump.fun API read with a modelled pool depth.
+- Coins paired with tokens other than SOL are outside the default universe and are not read from Solana.
+- Request load: about 3 requests/second to pump.fun plus about 1/second to Solana. If pump.fun starts refusing
+  requests, raise the poll interval in Settings.
+- Replay a pump.fun recording locally with `PONS_VENUE=pumpfun` set:
+  `set PONS_VENUE=pumpfun` then `python -m ponspaper replay pumpfun_snapshots.jsonl.gz`.
+
 ## Running on Render (free plan)
 
 `render.yaml` describes the service. On Render: **New → Blueprint**, pick this repo, and paste a Postgres
@@ -101,6 +164,17 @@ connection string into `DATABASE_URL` when asked.
 - **Downloads:** the Trades tab downloads every trade as CSV; the Backtest tab downloads the recording. Replay it
   locally with `python -m ponspaper replay pons_snapshots.jsonl.gz`.
 - **No password:** anyone with the URL can view and change everything.
+
+### A second service for pump.fun
+
+Deploy the same repo again (e.g. from another free Render account) with `PONS_VENUE=pumpfun`.
+`render-pumpfun.yaml` has the settings: **New → Blueprint**, pick this repo, and set the Blueprint path to
+`render-pumpfun.yaml`. Or create a Web Service by hand with the same build/start commands and environment variables.
+`render.yaml` is unchanged, so the existing pons service is not affected.
+
+- **Database:** use a separate free database if you can. Sharing one with pons also works, because the tables
+  are prefixed (`pons_*` / `pump_*`). Recordings are kept for 1 day (`PONS_DB_KEEP_DAYS=1`), about 150 MB.
+- **Solana RPC:** add `SOLANA_RPC_URL` with your private RPC URL (recommended).
 
 ## Data
 

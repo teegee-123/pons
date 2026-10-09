@@ -2,6 +2,8 @@
 
   python -m ponspaper                 live paper trading + dashboard on http://127.0.0.1:8787
   python -m ponspaper replay          backtest/evolve strategies on recorded snapshots (data/snapshots)
+
+Set PONS_VENUE=pumpfun to trade pump.fun instead of pons (separate data folder and database tables).
 """
 import argparse
 import glob
@@ -15,12 +17,13 @@ import time
 import webbrowser
 
 from . import strategy as S
+from . import venue as V
 from .engine import Engine, deep_merge, DEFAULT_CONFIG, snapshot_items
 from .server import serve
 
 # Outside OneDrive so the constantly-changing state and snapshot files don't sync. Override with --data or PONS_DATA.
 DEFAULT_DATA = os.environ.get("PONS_DATA") or os.path.join(
-    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "ponspaper", "data")
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "ponspaper", V.DATA_SUBDIR)
 
 
 def cmd_run(a):
@@ -28,7 +31,7 @@ def cmd_run(a):
     eng.start()
     httpd = serve(eng, a.port, a.host)
     url = f"http://127.0.0.1:{a.port}/"
-    print(f"pons paper trader running -> {url}   (storage: {eng.store.kind}, data: {a.data})  Ctrl+C to stop", flush=True)
+    print(f"{V.LABEL} paper trader running -> {url}   (storage: {eng.store.kind}, data: {a.data})  Ctrl+C to stop", flush=True)
     # Render (and most hosts) stop the process with SIGTERM: shut down cleanly so state is saved.
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=httpd.shutdown, daemon=True).start())
     if not a.no_browser:
@@ -100,13 +103,13 @@ def cmd_replay(a):
 def cmd_ga(a):
     """Run the genetic lab on recorded data and save champions for the Backtest tab."""
     import random as _random
-    from .lab import DEFAULT_LAB, Lab
+    from .lab import Lab
     from .engine import SEEDS, snapshot_records
     files = sorted(sum((glob.glob(p) for p in (a.files or [os.path.join(a.data, "snapshots", "*.jsonl.gz")])), []))
     if not files:
         print("no snapshot files found - run the live trader for a while, or download a recording from the dashboard")
         return 1
-    cfg = deep_merge(DEFAULT_CONFIG, {"lab": DEFAULT_LAB})
+    cfg = deep_merge(DEFAULT_CONFIG, {})  # includes the venue's lab defaults
     try:
         with open(os.path.join(a.data, "config.json"), encoding="utf8") as fh:
             cfg = deep_merge(cfg, json.load(fh))
@@ -156,7 +159,8 @@ def cmd_ga(a):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="ponspaper", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(prog="ponspaper", description=f"{__doc__}\nvenue: {V.LABEL}",
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data", default=DEFAULT_DATA, help=f"data directory (default: {DEFAULT_DATA})")
     sub = p.add_subparsers(dest="cmd")
     r = sub.add_parser("run", help="live paper trading + dashboard (default)")

@@ -2,6 +2,7 @@
 
 The Postgres store buffers trades and snapshot recordings in memory and writes them together with the state
 every PONS_DB_SAVE_SEC seconds (default 600), so a free serverless database isn't kept awake by constant writes.
+Table names start with the venue (pons_*, pump_*), so a pons and a pump.fun service can share one database.
 """
 import csv
 import glob
@@ -13,6 +14,8 @@ import threading
 import time
 from datetime import datetime
 
+from . import venue as V
+
 TRADE_FIELDS = ["exit_time", "strategy_id", "strategy", "kind", "symbol", "address", "entry_time", "hold_min",
                 "cost_usd", "proceeds_usd", "pnl_usd", "ret_pct", "reason", "entry_drift_pct", "fill_src",
                 "ageMin", "mcapUsd", "progressPct", "chg1m", "chg5m", "tpm1", "vol1m", "ddPeak", "taxBps", "socials"]
@@ -21,7 +24,7 @@ TRADE_FIELDS = ["exit_time", "strategy_id", "strategy", "kind", "symbol", "addre
 def open_store(data_dir):
     url = os.environ.get("DATABASE_URL")
     if url:
-        return PgStore(url, data_dir)
+        return PgStore(url, data_dir, V.TABLE_PREFIX)
     return FileStore(data_dir)
 
 
@@ -121,11 +124,12 @@ class FileStore:
 class PgStore:
     kind = "postgres"
 
-    def __init__(self, url, data_dir):
+    def __init__(self, url, data_dir, prefix="pons"):
         import psycopg  # only needed when DATABASE_URL is set (see requirements.txt)
         self._psycopg = psycopg
         self.url = url
         self.dir = data_dir
+        self.kv, self.tr, self.sn = f"{prefix}_kv", f"{prefix}_trades", f"{prefix}_snapshots"
         self.save_every = float(os.environ.get("PONS_DB_SAVE_SEC", "600"))
         self.keep_days = float(os.environ.get("PONS_DB_KEEP_DAYS", "10"))
         self._lock = threading.Lock()
@@ -136,9 +140,9 @@ class PgStore:
         self._conn = None
         self.last_error = None
         with self._db() as c:
-            c.execute("create table if not exists pons_kv (k text primary key, v text not null, updated timestamptz default now())")
-            c.execute("create table if not exists pons_trades (id bigserial primary key, t timestamptz default now(), row jsonb not null)")
-            c.execute("create table if not exists pons_snapshots (id bigserial primary key, t timestamptz default now(), data bytea not null)")
+            c.execute(f"create table if not exists {self.kv} (k text primary key, v text not null, updated timestamptz default now())")
+            c.execute(f"create table if not exists {self.tr} (id bigserial primary key, t timestamptz default now(), row jsonb not null)")
+            c.execute(f"create table if not exists {self.sn} (id bigserial primary key, t timestamptz default now(), data bytea not null)")
 
     def _db(self):
         if self._conn is None or self._conn.closed:
@@ -161,11 +165,11 @@ class PgStore:
                     raise
 
     def _get(self, k):
-        row = self._run(lambda c: (c.execute("select v from pons_kv where k=%s", (k,)), c.fetchone())[1])
+        row = self._run(lambda c: (c.execute(f"select v from {self.kv} where k=%s", (k,)), c.fetchone())[1])
         return json.loads(row[0]) if row else None
 
     def _put(self, c, k, v):
-        c.execute("insert into pons_kv (k, v) values (%s, %s) on conflict (k) do update set v=excluded.v, updated=now()", (k, v))
+        c.execute(f"insert into {self.kv} (k, v) values (%s, %s) on conflict (k) do update set v=excluded.v, updated=now()", (k, v))
 
     def load_config(self):
         return self._get("config")
@@ -201,10 +205,10 @@ class PgStore:
             if state is not None:
                 self._put(c, "state", state)
             for r in trades:
-                c.execute("insert into pons_trades (row) values (%s::jsonb)", (json.dumps(r),))
+                c.execute(f"insert into {self.tr} (row) values (%s::jsonb)", (json.dumps(r),))
             if blob:
-                c.execute("insert into pons_snapshots (data) values (%s)", (blob,))
-                c.execute("delete from pons_snapshots where t < to_timestamp(%s)", (cut,))
+                c.execute(f"insert into {self.sn} (data) values (%s)", (blob,))
+                c.execute(f"delete from {self.sn} where t < to_timestamp(%s)", (cut,))
         try:
             self._run(write)
             self.last_error = None
@@ -217,7 +221,7 @@ class PgStore:
                 self._snaps = snaps + self._snaps
 
     def trades_csv(self):
-        rows = self._run(lambda c: (c.execute("select row from pons_trades order by id"), c.fetchall())[1]) or []
+        rows = self._run(lambda c: (c.execute(f"select row from {self.tr} order by id"), c.fetchall())[1]) or []
         with self._lock:
             pending = list(self._trades)
         out = io.StringIO()
@@ -232,10 +236,10 @@ class PgStore:
 
     def snapshot_lines(self, since):
         """Recorded lines newer than roughly `since`, chunk by chunk, then whatever is still buffered."""
-        ids = self._run(lambda c: (c.execute("select id from pons_snapshots where t >= to_timestamp(%s) order by id",
+        ids = self._run(lambda c: (c.execute(f"select id from {self.sn} where t >= to_timestamp(%s) order by id",
                                              (since - self.save_every,)), c.fetchall())[1]) or []
         for (i,) in ids:
-            row = self._run(lambda c: (c.execute("select data from pons_snapshots where id=%s", (i,)), c.fetchone())[1])
+            row = self._run(lambda c: (c.execute(f"select data from {self.sn} where id=%s", (i,)), c.fetchone())[1])
             if row:
                 yield from gzip.decompress(bytes(row[0])).decode().splitlines()
         with self._lock:
@@ -243,7 +247,7 @@ class PgStore:
         yield from pending
 
     def snapshots_gz(self):
-        rows = self._run(lambda c: (c.execute("select data from pons_snapshots order by id"), c.fetchall())[1]) or []
+        rows = self._run(lambda c: (c.execute(f"select data from {self.sn} order by id"), c.fetchall())[1]) or []
         with self._lock:
             pending = list(self._snaps)
         out = io.BytesIO()

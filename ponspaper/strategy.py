@@ -5,6 +5,9 @@ import random
 import time
 import uuid
 
+from . import pumpfun
+from . import venue as V
+
 # key -> (label, unit, kind, help). kind: "range" ({"min","max"}) or "enum" ({"in": [...]}).
 FILTERS = {
     "ageMin":      ("Age", "min", "range", "Minutes since the token was created"),
@@ -28,11 +31,22 @@ FILTERS = {
     "whale1m":     ("Biggest buy 1m", "$", "range", "Largest single buy in the last minute, USD (tick data)"),
     "volSpike":    ("Volume spike", "x", "range", "Last minute's volume vs the average minute over the last 15 (tick data)"),
     "devSoldUsd":  ("Creator sold", "$", "range", "USD the token's creator has sold since we started watching (tick data)"),
-    "stage":       ("Stage", "", "enum", "curve = still on the bonding curve, graduated = trading in the v4 pool"),
-    "quote":       ("Quote asset", "", "enum", "ETH-paired or paired with another token"),
+    "inflow1m":    ("Net inflow 1m", "$", "range", "Buys minus sells into the bonding curve over the last minute, USD (from curve reserves)"),
+    "inflow5m":    ("Net inflow 5m", "$", "range", "Buys minus sells into the bonding curve over the last 5 minutes, USD (from curve reserves)"),
+    "fillRate":    ("Curve speed", "%/min", "range", "Bonding-curve progress per minute since launch"),
+    "athDdPct":    ("Below ATH", "%", "range", "How far market cap is below its all-time high (pump.fun's record, not just the last 30 min)"),
+    "replies":     ("Replies", "#", "range", "Comments on the coin's pump.fun page"),
+    "creatorCoins": ("Creator's coins 24h", "#", "range", "Coins the same wallet launched in the last 24h, this one included (launches seen since start-up)"),
+    "live":        ("Livestream", "", "enum", "The creator is livestreaming on pump.fun right now"),
+    "mayhem":      ("Mayhem mode", "", "enum", "Launched in pump.fun's Mayhem mode: an AI agent trades it and the curve is non-standard (often very thin)"),
+    "stage":       ("Stage", "", "enum", "curve = still on the bonding curve, graduated = trading in the DEX pool"),
+    "quote":       ("Quote asset", "", "enum", f"{V.QUOTE}-paired or paired with another token"),
     "buyback":     ("Buyback", "", "enum", "Buyback-and-burn enabled"),
 }
-ENUM_OPTIONS = {"stage": ["curve", "graduated"], "quote": ["ETH", "OTHER"], "buyback": ["yes", "no"]}
+# signals the venue can't provide are dropped, so they can't be filtered on, evolved or bucketed
+FILTERS = {k: v for k, v in FILTERS.items() if k not in V.UNAVAILABLE}
+ENUM_OPTIONS = {"stage": ["curve", "graduated"], "quote": [V.QUOTE, "OTHER"], "buyback": ["yes", "no"], "live": ["yes", "no"],
+                "mayhem": ["yes", "no"]}
 
 EXIT_FIELDS = {
     "tpPct":       ("Take profit", "%", "Sell when the net return (after all fees, impact and gas) reaches this"),
@@ -166,6 +180,9 @@ SPACE = [
     ("exits.staleMin",          [1, 2, 5, 10, 20], 0.6),
     ("exits.stuckMin",          [2, 3, 5, 10, 20, 45, 90], 0.5),
 ]
+if V.PUMP:
+    SPACE = [(path, pumpfun.SPACE_VALUES.get(path, values), p_on) for path, values, p_on in SPACE
+             if path.split(".")[1] not in V.UNAVAILABLE] + pumpfun.SPACE_EXTRA
 GENE_PATHS = [g[0] for g in SPACE]
 
 
@@ -266,12 +283,18 @@ def describe(spec):
                                     ("tradeCount", "trades", "", 1), ("idleSec", "idle", "s", 1), ("taxBps", "tax", "bps", 1),
                                     ("socials", "soc", "", 1), ("buyRatio1m", "buy%", "%", 1), ("netFlow1m", "flow", "$", 1),
                                     ("buyers5m", "buyers", "", 1), ("sellers5m", "sellers", "", 1), ("whale1m", "whale", "$", 1),
-                                    ("volSpike", "spike", "x", 1), ("devSoldUsd", "devsold", "$", 1)):
+                                    ("volSpike", "spike", "x", 1), ("devSoldUsd", "devsold", "$", 1),
+                                    ("inflow1m", "in1m", "$", 1), ("inflow5m", "in5m", "$", 1), ("fillRate", "speed", "%/m", 1),
+                                    ("athDdPct", "ath-dd", "%", 1), ("replies", "replies", "", 1), ("creatorCoins", "devcoins", "", 1)):
         t = rng_txt(key, unit, scale)
         if t:
             parts.append(f"{label} {t}")
     if f.get("stage"):
         parts.append("/".join(f["stage"]["in"]))
+    if f.get("live"):
+        parts.append("live " + "/".join(f["live"]["in"]))
+    if f.get("mayhem"):
+        parts.append("mayhem " + "/".join(f["mayhem"]["in"]))
     xs = [f"tp{ex.get('tpPct'):g}" if ex.get("tpPct") is not None else None,
           f"sl{ex.get('slPct'):g}" if ex.get("slPct") is not None else None,
           f"tr{ex.get('trailPct'):g}@{(ex.get('trailArmPct') or 0):g}" if ex.get("trailPct") is not None else None,

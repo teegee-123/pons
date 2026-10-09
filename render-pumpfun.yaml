@@ -1,0 +1,22 @@
+# The same code paper-trading pump.fun instead of pons. Kept out of render.yaml on purpose, so the existing pons
+# Blueprint never picks this service up. On the other Render account: New -> Blueprint, pick this repo and set the
+# Blueprint path to render-pumpfun.yaml (or create a Web Service by hand with the same settings).
+services:
+  - type: web
+    name: pumpfun-paper-trader
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m ponspaper run --no-browser --host 0.0.0.0
+    healthCheckPath: /health
+    envVars:
+      - key: PONS_VENUE        # selects pump.fun; without it the service trades pons
+        value: pumpfun
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: DATABASE_URL      # Postgres connection string; you paste it in the Render dashboard
+        sync: false
+      - key: PONS_DB_SAVE_SEC  # how often state, trades and recordings are written to the database
+        value: "900"
+      - key: PONS_DB_KEEP_DAYS # pump.fun records far more than pons: keep one day to fit a free database
+        value: "1"

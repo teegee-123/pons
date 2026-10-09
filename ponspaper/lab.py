@@ -14,6 +14,9 @@ Pipeline
      profitable, and different ideas (genomes that trade the same tokens as many others are marked down).
   6. Live feedback: champions that fail in live paper trading are blacklisted and their close relatives are
      marked down; live winners are fed back into the population.
+  7. Slippage calibration (calibrateSlippage): recorded snapshots can't show how far the price moves between a
+     signal and its fill, but live fills measure it. The measured per-side slippage is charged on every simulated
+     trade, so the lab's returns match what live trading actually gets.
 """
 import bisect
 import heapq
@@ -36,7 +39,7 @@ FI = {k: i for i, k in enumerate(FEAT_KEYS)}
 DEFAULT_LAB = {"enabled": True, "windowHours": 12, "validateFrac": 0.3, "population": 60, "elite": 4,
                "tournament": 3, "crossover": 0.7, "mutation": 0.12, "immigrants": 0.1, "minTrades": 12,
                "minValTrades": 15, "rebuildMin": 90, "sampleEverySec": 10, "duty": 0.3,
-               "promoteCount": 3, "maxGensPerData": 50,
+               "promoteCount": 3, "maxGensPerData": 50, "calibrateSlippage": False, "candGapSec": 0,
                # exams
                "folds": 4, "minFoldShare": 0.5, "stressLatencyMs": 750, "stressFeeBps": 50,
                # scoring
@@ -49,7 +52,7 @@ DEFAULT_LAB = {"enabled": True, "windowHours": 12, "validateFrac": 0.3, "populat
 class Dataset:
     """Entry candidates (features when a token trades) + per-token price paths."""
 
-    def __init__(self, records, ex, universe, sample_every=10.0, yield_every=0.0):
+    def __init__(self, records, ex, universe, sample_every=10.0, yield_every=0.0, cand_gap=0.0):
         self.ex = dict(ex)
         self.size_usd = None
         self.tok_addr, self.tok_sym = [], []
@@ -94,7 +97,8 @@ class Dataset:
                         self.pp[i].append((v.Q, v.T, v.sellable, v.fee_frac, qu, d.get("lastTradeAt") or t))
                 if not self.pt[i]:
                     continue
-                if not changed and t - last_c.get(i, 0) < sample_every:
+                # a candidate when the token traded (at most every cand_gap s), else every sample_every s
+                if t - last_c.get(i, 0) < (cand_gap if changed else sample_every):
                     continue
                 pending.append((tok, i))
             # trades are applied before features, exactly like the live engine; a recording gap restarts windows
@@ -421,6 +425,7 @@ class Lab:
         self.gens_on_data = 0
         self.split = None
         self.folds = []
+        self.slip, self.slip_n = 0.0, 0  # per-side slippage measured on live fills (fraction), and from how many
 
     @property
     def lc(self):
@@ -429,7 +434,8 @@ class Lab:
     # ---- data
     def build(self, records, yield_every=0.0):
         self.phase = "building dataset"
-        ds = Dataset(records, self.cfg["execution"], self.cfg["universe"], self.lc["sampleEverySec"], yield_every)
+        ds = Dataset(records, self.cfg["execution"], self.cfg["universe"], self.lc["sampleEverySec"], yield_every,
+                     self.lc.get("candGapSec") or 0.0)
         if not ds.cands or ds.hours < 0.25:
             self.phase = "waiting for data"
             raise ValueError(f"not enough recorded data yet ({ds.hours:.2f}h, {len(ds.cands)} candidates)")
@@ -438,9 +444,11 @@ class Lab:
         self.ds = ds
         self.gens_on_data = 0
         self.best_seen = -math.inf
-        self.ev = Evaluator(ds, ex, self.cfg["sizing"])
+        slip = self.slip if lc.get("calibrateSlippage") else 0.0
+        self.ev = Evaluator(ds, ex, self.cfg["sizing"], extra_fee=slip)
         self.ev_stress = Evaluator(ds, ex, self.cfg["sizing"], extra_latency=lc["stressLatencyMs"] / 1000.0,
-                                   extra_fee=lc["stressFeeBps"] / 1e4)
+                                   extra_fee=lc["stressFeeBps"] / 1e4 + slip)
+        self.slip_used = slip
         self.split = ds.split_time(lc["validateFrac"])
         m = bisect.bisect_left(ds.cands, (self.split,))
         k = max(1, int(lc["folds"]))
@@ -680,6 +688,7 @@ class Lab:
         return {
             "phase": self.phase, "lastError": self.last_error, "gen": self.gen, "evals": self.evals,
             "genSecs": self.gen_secs, "mutation": self.mutation,
+            "slippage": {"perSide": getattr(self, "slip_used", 0.0), "measured": self.slip, "fills": self.slip_n},
             "dataset": None if ds is None else {"hours": ds.hours, "rows": ds.rows, "cands": len(ds.cands),
                                                 "tokens": len(ds.tok_addr), "t0": ds.t0, "t1": ds.t1,
                                                 "split": self.split, "builtAt": ds.built_at, "folds": len(self.folds) + 1},
