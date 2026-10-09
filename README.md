@@ -53,8 +53,7 @@ Limitations:
 
 ## Finding winning strategies
 
-- **Leaderboard:** 4 starter manual strategies (5 on pump.fun, which adds *Near graduation*) plus 40 auto strategies, each
-  with its own $1,000 bankroll.
+- **Leaderboard:** 4 starter manual strategies plus 40 auto strategies, each with its own $1,000 bankroll.
   Promote an auto strategy to keep it permanently.
 - **Score:** mark-to-market average net return per trade (open positions valued at what selling now would
   return), shrunk toward 0 when there are few trades. This keeps lucky 1–2 trade strategies from topping the board.

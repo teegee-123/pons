@@ -75,11 +75,6 @@ SEEDS = [
      "exits": {"tpPct": 25, "slPct": 15, "trailPct": None, "maxHoldMin": 15, "staleMin": 5}},
     {"name": "Graduation run", "filters": {"progressPct": {"min": 75}, "stage": {"in": ["curve"]}, "chg5m": {"min": 0}},
      "exits": {"tpPct": 35, "slPct": 15, "trailPct": None, "maxHoldMin": 30, "staleMin": 5}},
-    # the one edge-map group positive at a 15-minute hold on the first day (+11.9% +- 9.1, 108 samples; a recording of
-    # the same day disagreed): around graduation, which is ~$45k at $110/SOL, so mostly coins that just graduated
-    {"name": "Near graduation (edge map)", "filters": {"mcapUsd": {"min": 40000, "max": 60000}},
-     "exits": {"tpPct": None, "slPct": None, "trailPct": None, "trailArmPct": None, "maxHoldMin": 15, "staleMin": None,
-               "stuckMin": None}},
 ]
 
 # Search-space changes for auto strategies: pump.fun market caps, plus curve-progress genes to make up for the
