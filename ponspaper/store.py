@@ -3,6 +3,8 @@
 The Postgres store buffers trades and snapshot recordings in memory and writes them together with the state
 every PONS_DB_SAVE_SEC seconds (default 600), so a free serverless database isn't kept awake by constant writes.
 Table names start with the venue (pons_*, pump_*), so a pons and a pump.fun service can share one database.
+Stored trades older than PONS_DB_TRADE_KEEP_DAYS are deleted (default: never on pons, 7 days on pump.fun). If the
+database refuses writes (e.g. a full free database), unsaved data is kept in memory only up to a cap.
 """
 import csv
 import glob
@@ -16,6 +18,8 @@ from datetime import datetime
 
 from . import venue as V
 
+MAX_PENDING_SNAPS = 5000    # recording lines held while the database refuses writes (a few hours)
+MAX_PENDING_TRADES = 20000
 TRADE_FIELDS = ["exit_time", "strategy_id", "strategy", "kind", "symbol", "address", "entry_time", "hold_min",
                 "cost_usd", "proceeds_usd", "pnl_usd", "ret_pct", "reason", "entry_drift_pct", "fill_src",
                 "ageMin", "mcapUsd", "progressPct", "chg1m", "chg5m", "tpm1", "vol1m", "ddPeak", "taxBps", "socials"]
@@ -132,6 +136,7 @@ class PgStore:
         self.kv, self.tr, self.sn = f"{prefix}_kv", f"{prefix}_trades", f"{prefix}_snapshots"
         self.save_every = float(os.environ.get("PONS_DB_SAVE_SEC", "600"))
         self.keep_days = float(os.environ.get("PONS_DB_KEEP_DAYS", "10"))
+        self.trade_keep_days = float(os.environ.get("PONS_DB_TRADE_KEEP_DAYS") or V.TRADE_KEEP_DAYS)
         self._lock = threading.Lock()
         self._db_lock = threading.RLock()
         self._trades = []
@@ -200,6 +205,7 @@ class PgStore:
             return
         blob = gzip.compress(("\n".join(snaps) + "\n").encode()) if snaps else None
         cut = time.time() - self.keep_days * 86400
+        cut_trades = time.time() - self.trade_keep_days * 86400 if self.trade_keep_days > 0 else None
 
         def write(c):
             if state is not None:
@@ -209,6 +215,8 @@ class PgStore:
             if blob:
                 c.execute(f"insert into {self.sn} (data) values (%s)", (blob,))
                 c.execute(f"delete from {self.sn} where t < to_timestamp(%s)", (cut,))
+            if cut_trades is not None:
+                c.execute(f"delete from {self.tr} where t < to_timestamp(%s)", (cut_trades,))
         try:
             self._run(write)
             self.last_error = None
@@ -217,8 +225,9 @@ class PgStore:
             with self._lock:
                 if self._state is None:
                     self._state = state
-                self._trades = trades + self._trades
-                self._snaps = snaps + self._snaps
+                # never grow without bound: a full or unreachable database must not exhaust memory
+                self._trades = (trades + self._trades)[-MAX_PENDING_TRADES:]
+                self._snaps = (snaps + self._snaps)[-MAX_PENDING_SNAPS:]
 
     def trades_csv(self):
         rows = self._run(lambda c: (c.execute(f"select row from {self.tr} order by id"), c.fetchall())[1]) or []

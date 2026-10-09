@@ -84,6 +84,18 @@ Limitations:
   - **CPU:** limited to 30% of a CPU, and it pauses after 50 generations on the same data until the next refresh.
   - **Locally:** `python -m ponspaper ga [recording.jsonl.gz]`.
 - **Time stop:** an exit gene the GA can evolve. It sells a position that has been under water for N minutes.
+- **Long-run record (weeks, not hours):** the lab trains on a short recent window, so on its own it forgets. On
+  every data refresh (~90 minutes) each tracked genome - the best of each round, champions and live winners, up to
+  400 - is also scored on the new stretch of data, counting only trades it could not have been bred on (data that
+  arrived after it started being tracked). Only running totals are kept (stretches won, trades, average, a compact
+  cumulative curve), saved with the lab state, so the record outlives the raw recordings and keeps growing for as
+  long as the service runs.
+  - **Proven:** 12+ stretches with trades (~18h), 40+ trades, profitable in most stretches, and average net return
+    per trade minus one standard error still above zero. Proven genomes breed with a bonus, are always put back in
+    the population, go live first (`LR-...` strategies), and lose the status only if their record turns negative
+    ("faded"), not after one bad window.
+  - The Genetic lab tab shows the record; thresholds are under Settings → Genetic lab (*Long-run breeding weight*
+    0 = ignore the record when breeding).
 - **Edge map:** strategy-independent. Every universe token is sampled as a hypothetical trade and valued after
   1/5/15/30 minutes. It shows which age, mcap, momentum, etc. buckets have positive expectancy after costs.
 - **Filters & settings:** the *trading universe* is the set of global filters (default: ETH-paired tokens, age
@@ -172,6 +184,8 @@ Deploy the same repo again (e.g. from another free Render account) with `PONS_VE
 `render-pumpfun.yaml`. Or create a Web Service by hand with the same build/start commands and environment variables.
 `render.yaml` is unchanged, so the existing pons service is not affected.
 
+- **Stored trades** are deleted after 7 days on pump.fun (`PONS_DB_TRADE_KEEP_DAYS`; pons keeps all), and if the
+  database refuses writes the unsaved backlog in memory is capped, so a full free database can't crash the service.
 - **Database:** use a separate free database if you can. Sharing one with pons also works, because the tables
   are prefixed (`pons_*` / `pump_*`). Recordings are kept for 1 day (`PONS_DB_KEEP_DAYS=1`), about 150 MB.
 - **Solana RPC:** add `SOLANA_RPC_URL` with your private RPC URL (recommended).

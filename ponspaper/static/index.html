@@ -161,6 +161,10 @@ a { color: var(--accent); text-decoration: none; }
     </div>
     <div class="card"><h2>Fitness by generation <small>training data</small></h2>
       <div class="legend" id="labLegend"></div><div class="chart" id="labChart" style="margin-top:6px"></div></div>
+    <div class="card"><h2>Long-run record <small>every tracked genome, scored on each new stretch of data it was never bred on, kept for good</small></h2>
+      <p class="help">The lab trains on a short recent window, so on its own it forgets. This record doesn't: each time the data refreshes (about every 90 minutes), every tracked genome is scored on the new stretch, counting only trades it could not have been bred on. Only running totals are kept, so the record outlives the raw recordings and keeps growing for weeks. <b>Proven</b> = enough stretches and trades, profitable in most stretches, and average return minus one standard error still above zero. Proven genomes breed with a bonus, always return to the population and go live first.</p>
+      <div class="statgrid" id="lrStats"></div>
+      <div class="tablewrap"><table id="lrTbl"></table></div></div>
     <div class="card"><h2>Validated champions <small>profitable on training and validation data</small></h2>
       <div class="tablewrap"><table id="labHall"></table></div></div>
     <div class="card"><h2>Current generation <small>top 12 by training fitness</small></h2>

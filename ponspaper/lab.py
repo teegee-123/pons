@@ -17,6 +17,11 @@ Pipeline
   7. Slippage calibration (calibrateSlippage): recorded snapshots can't show how far the price moves between a
      signal and its fill, but live fills measure it. The measured per-side slippage is charged on every simulated
      trade, so the lab's returns match what live trading actually gets.
+  8. Long-run record: the lab only trains on a short recent window, so on its own it forgets. Every tracked genome
+     (the best of each window, champions, live winners) is also scored on each new stretch of data that arrived
+     after it was added, i.e. data it was never bred on. Only running totals are kept, so the record survives the
+     raw data being deleted and keeps growing for weeks. Genomes with a long, positive record are "proven": they
+     breed with a bonus, are always put back in the population, and go live first.
 """
 import bisect
 import heapq
@@ -30,6 +35,7 @@ from .market import Market
 from .sim import model_venue
 
 CLONE = -1000.0  # fitness given to a genome that duplicates another's trades
+SERIES_CAP = 160  # long-run record: chart points per genome; when full, neighbours merge so it spans the whole life
 UNQUALIFIED = -80.0  # base fitness below minTrades (plus 2 per trade), so selection still pushes toward trading
 RANGE_KEYS = [k for k, v in S.FILTERS.items() if v[2] == "range"]
 ENUM_KEYS = [k for k, v in S.FILTERS.items() if v[2] == "enum"]
@@ -46,7 +52,10 @@ DEFAULT_LAB = {"enabled": True, "windowHours": 12, "validateFrac": 0.3, "populat
                "complexityPenalty": 0.5, "consistencyPenalty": 4.0, "ddPenalty": 0.1, "activityBonus": 0.5,
                "nicheSimilarity": 0.5, "nichePenalty": 1.0,
                # live feedback
-               "feedbackPenalty": 3.0, "feedbackBonus": 1.5}
+               "feedbackPenalty": 3.0, "feedbackBonus": 1.5,
+               # long-run record (forward test on every new stretch of data)
+               "ledgerSize": 400, "ledgerAdd": 20, "segmentMin": 30, "segmentTailMin": 15,
+               "provenSegments": 12, "provenTrades": 40, "provenShare": 0.55, "longRunWeight": 1.0}
 
 
 class Dataset:
@@ -426,13 +435,17 @@ class Lab:
         self.split = None
         self.folds = []
         self.slip, self.slip_n = 0.0, 0  # per-side slippage measured on live fills (fraction), and from how many
+        self.ledger = {}        # genome key -> long-run record (see _ledger_update); replaced, never resized in place
+        self.ledger_t = None    # data time the last long-run segment ended
+        self.ledger_first = None
+        self.ledger_segs = 0
 
     @property
     def lc(self):
         return self.cfg["lab"]
 
     # ---- data
-    def build(self, records, yield_every=0.0):
+    def build(self, records, yield_every=0.0, throttle=None):
         self.phase = "building dataset"
         ds = Dataset(records, self.cfg["execution"], self.cfg["universe"], self.lc["sampleEverySec"], yield_every,
                      self.lc.get("candGapSec") or 0.0)
@@ -454,7 +467,11 @@ class Lab:
         k = max(1, int(lc["folds"]))
         self.folds = [ds.cands[int(m * j / k)][0] for j in range(1, k)] if m > k else []
         self.train_hours = ds.hours * (1.0 - lc["validateFrac"])
+        self._ledger_update(ds, throttle)
         self._revalidate_hall()
+        proven = [e["genome"] for e in self.ledger.values() if e["status"] == "proven"]
+        if proven and self.pop:
+            self.inject(proven)  # proven genomes never drop out of the gene pool
         self.phase = "evolving"
 
     # ---- population
@@ -542,7 +559,8 @@ class Lab:
             if e["fit"] > CLONE:
                 e["vec"] = gene_vector(e["genome"])
                 e["feedback"] = self._feedback_adjust(e["vec"])
-                e["sel"] = e["fit"] - lc["nichePenalty"] * e["similar"] + e["feedback"]
+                e["longrun"] = self._longrun_adjust(S.genome_key(e["genome"]))
+                e["sel"] = e["fit"] - lc["nichePenalty"] * e["similar"] + e["feedback"] + e["longrun"]
         scored.sort(key=lambda x: x["fit"], reverse=True)
         self.scored = scored
         qual = [e["fit"] for e in live]
@@ -596,6 +614,96 @@ class Lab:
         self.gen += 1
         self.gens_on_data += 1
         self.gen_secs = time.time() - t0
+
+    # ---- long-run record
+    def _ledger_update(self, ds, throttle=None):
+        """Score every tracked genome on the data that arrived since the previous update, counting only entries
+        after the genome was added (so it was never bred on them), then start tracking this round's best."""
+        lc = self.lc
+        seg_from = max(self.ledger_t or ds.t0, ds.t0)
+        seg_to = ds.t1 - lc["segmentTailMin"] * 60  # leave a tail so most of the segment's trades can close
+        if seg_to - seg_from >= lc["segmentMin"] * 60:
+            for e in list(self.ledger.values()):
+                t_from = max(seg_from, e["since"])
+                if seg_to - t_from < lc["segmentMin"] * 60:
+                    continue
+                te = time.time()
+                res = self.ev.evaluate(e["genome"], t_from=t_from, t_to=seg_to)
+                n = res["n"]
+                e["seen"] += 1
+                if n:
+                    mean, sd = res["mean"], res["sd"] or 0.0
+                    e["segs"] += 1
+                    e["pos"] += 1 if mean > 0 else 0
+                    e["n"] += n
+                    e["sr"] += mean * n
+                    e["sr2"] += (sd * sd + mean * mean) * n
+                    e["wins"] += round(res["win"] * n)
+                    e["pnl"] += res["pnl"]
+                e["series"] = _append_point(e["series"], [round(seg_to), n, round(res["mean"] * n, 5) if n else 0.0])
+                e["last"] = seg_to
+                status = self._ledger_status(e)
+                e["wasProven"] = e.get("wasProven") or status == "proven"
+                e["status"] = status
+                if throttle:
+                    throttle(time.time() - te)
+            self.ledger_t = seg_to
+            self.ledger_first = self.ledger_first or seg_from
+            self.ledger_segs += 1
+        elif self.ledger_t is None:
+            self.ledger_t = seg_to
+        # start tracking: this round's best genomes, champions and live winners, from the end of this window on
+        new = {}
+        picks = [e["genome"] for e in sorted(self.scored, key=lambda x: x["sel"], reverse=True)
+                 if e["fit"] > CLONE and e["res"]["n"] >= lc["minTrades"]][: int(lc["ledgerAdd"])]
+        picks += [h["genome"] for h in self.hall]
+        picks += [f["genome"] for f in self.feedback.values() if f["status"] == "winning"]
+        for g in picks:
+            k = S.genome_key(g)
+            if k not in self.ledger and k not in new:
+                new[k] = {"genome": S.genome(g), "since": ds.t1, "added": time.time(), "seen": 0, "segs": 0, "pos": 0,
+                          "n": 0, "sr": 0.0, "sr2": 0.0, "wins": 0, "pnl": 0.0, "series": [], "status": "tracking",
+                          "last": None}
+        ledger = {**self.ledger, **new}
+        if len(ledger) > lc["ledgerSize"]:  # keep proven, then the most promising; drop proven losers first
+            keep = sorted(ledger.items(), key=lambda kv: self._keep_rank(kv[1]), reverse=True)[: int(lc["ledgerSize"])]
+            ledger = dict(keep)
+        self.ledger = ledger  # replaced in one go: the dashboard may be reading the old one
+
+    def _ledger_status(self, e):
+        lc = self.lc
+        if e["segs"] < lc["provenSegments"] or e["n"] < lc["provenTrades"]:
+            return "tracking"
+        lcb = ledger_lcb(e)
+        if lcb is not None and lcb > 0 and e["pos"] / e["segs"] >= lc["provenShare"]:
+            return "proven"
+        return "losing"
+
+    @staticmethod
+    def _keep_rank(e):
+        lcb = ledger_lcb(e)
+        lcb = lcb if lcb is not None else 0.0
+        if e["status"] == "proven":
+            return (3, lcb)
+        if e["status"] == "tracking":
+            return (1, lcb) if e["segs"] >= 4 and lcb < 0 else (2, lcb, -e["added"])
+        return (0, lcb)
+
+    def _longrun_adjust(self, key):
+        """Breeding bonus (or penalty) from the long-run record, in fitness points (% per trade)."""
+        e = self.ledger.get(key)
+        if not e or e["segs"] < 3 or e["n"] < self.lc["minTrades"]:  # a few lucky trades must not steer breeding
+            return 0.0
+        lcb = ledger_lcb(e)
+        return 0.0 if lcb is None else self.lc.get("longRunWeight", 1.0) * max(-10.0, min(10.0, lcb))
+
+    def pick(self, keys):
+        """Champions or long-run genomes with these keys (for a forced live deploy)."""
+        out = [h for h in self.hall if h["key"] in keys]
+        have = {h["key"] for h in out}
+        out += [{"key": k, "genome": e["genome"], "gen": 0, "longrun": True}
+                for k, e in self.ledger.items() if k in keys and k not in have]
+        return out
 
     # ---- exams
     def _exam(self, g, fit=None, parts=None, res=None):
@@ -676,8 +784,13 @@ class Lab:
                 del self.feedback[k]
 
     def champions(self, n):
-        """Best validated genomes not yet deployed to live."""
-        return [h for h in self.hall if h["key"] not in self.deployed][:n]
+        """Genomes for live trading, not yet deployed: long-run proven ones first, then validated champions."""
+        proven = sorted((kv for kv in self.ledger.items() if kv[1]["status"] == "proven" and kv[0] not in self.deployed),
+                        key=lambda kv: ledger_lcb(kv[1]) or 0.0, reverse=True)
+        picks = [{"key": k, "genome": e["genome"], "gen": 0, "longrun": True} for k, e in proven]
+        have = {p["key"] for p in picks}
+        picks += [h for h in self.hall if h["key"] not in self.deployed and h["key"] not in have]
+        return picks[:n]
 
     def view(self):
         ds = self.ds
@@ -697,21 +810,43 @@ class Lab:
                      | {"desc": S.describe(h["genome"]), "deployed": h["key"] in self.deployed, "live": fb(h["key"])}
                      for h in self.hall],
             "dropped": getattr(self, "dropped", [])[-10:],
+            "ledger": self._ledger_view(fb),
             "feedback": {"failed": sum(1 for f in self.feedback.values() if f["status"] == "failed"),
                          "winning": sum(1 for f in self.feedback.values() if f["status"] == "winning"),
                          "losing": sum(1 for f in self.feedback.values() if f["status"] == "losing")},
             "top": [{"fitness": e["fit"], "sel": e["sel"], "parts": e["parts"], "similar": e["similar"],
-                     "feedback": e.get("feedback", 0.0), "desc": S.describe(e["genome"]), "train": _brief(e["res"]),
+                     "feedback": e.get("feedback", 0.0), "longrun": e.get("longrun", 0.0),
+                     "desc": S.describe(e["genome"]), "train": _brief(e["res"]),
                      "consistency": e["res"].get("consistency"), "nfilters": e["res"].get("nfilters"),
                      "clone": e["fit"] <= CLONE} for e in self.scored[:12]],
         }
+
+    def _ledger_view(self, fb, limit=40):
+        order = {"proven": 0, "tracking": 1, "losing": 2}
+        rows = sorted(self.ledger.items(), key=lambda kv: (order.get(kv[1]["status"], 3), -(ledger_lcb(kv[1]) or -1e9)))
+        out = []
+        for k, e in rows[:limit]:
+            n = e["n"]
+            cum, run = [], 0.0
+            for _, sn, ssum in e["series"]:
+                run += ssum
+                cum.append(round(run * 100, 2))
+            out.append({"key": k, "desc": S.describe(e["genome"]), "status": e["status"], "wasProven": e.get("wasProven", False),
+                        "segs": e["segs"], "seen": e["seen"], "pos": e["pos"], "n": n,
+                        "mean": e["sr"] / n if n else None, "lcb": ledger_lcb(e), "win": e["wins"] / n if n else None,
+                        "pnl": e["pnl"], "since": e["since"], "last": e["last"], "curve": cum,
+                        "deployed": k in self.deployed, "live": fb(k)})
+        return {"tracked": len(self.ledger), "proven": sum(1 for e in self.ledger.values() if e["status"] == "proven"),
+                "segments": self.ledger_segs, "first": self.ledger_first, "last": self.ledger_t, "rows": out}
 
     def to_dict(self):
         strip = lambda h: {k: v for k, v in h.items() if k != "vec"}
         return {"pop": self.pop, "hall": [strip(h) for h in self.hall], "gen": self.gen, "evals": self.evals,
                 "history": self.history, "deployed": list(self.deployed), "mutation": self.mutation,
                 "best_seen": self.best_seen if math.isfinite(self.best_seen) else None,
-                "feedback": {k: strip(v) for k, v in self.feedback.items()}}
+                "feedback": {k: strip(v) for k, v in self.feedback.items()},
+                "ledger": dict(self.ledger), "ledger_t": self.ledger_t, "ledger_first": self.ledger_first,
+                "ledger_segs": self.ledger_segs}
 
     def load(self, d):
         if not d:
@@ -728,6 +863,30 @@ class Lab:
         for k, v in (d.get("feedback") or {}).items():
             v["vec"] = gene_vector(v["genome"])
             self.feedback[k] = v
+        self.ledger = {k: dict(e, genome=S.genome(e["genome"])) for k, e in (d.get("ledger") or {}).items()}
+        self.ledger_t = d.get("ledger_t")
+        self.ledger_first = d.get("ledger_first")
+        self.ledger_segs = d.get("ledger_segs", 0)
+
+
+def ledger_lcb(e):
+    """Long-run record: average net return per trade minus one standard error, in % (None without trades)."""
+    n = e["n"]
+    if n < 2:  # no standard error from a single trade
+        return None
+    mean = e["sr"] / n
+    sd = math.sqrt(max(0.0, e["sr2"] / n - mean * mean))
+    return 100.0 * (mean - sd / math.sqrt(n))
+
+
+def _append_point(series, point):
+    """Add a [t, trades, sum of returns] point; when over SERIES_CAP, merge neighbouring pairs (sums add up, the
+    later time is kept) so the series always covers the genome's whole life at a coarser step."""
+    series = series + [point]
+    if len(series) > SERIES_CAP:
+        merged = [[b[0], a[1] + b[1], round(a[2] + b[2], 5)] for a, b in zip(series[0::2], series[1::2])]
+        series = merged + ([series[-1]] if len(series) % 2 else [])
+    return series
 
 
 def _brief(r):

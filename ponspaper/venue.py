@@ -32,6 +32,7 @@ if PUMP:
     FILE_PREFIX = "pumpfun"
     TOKEN_URL = "https://pump.fun/coin/"
     FORGET_IDLE_SEC = 1800                         # pump.fun launches ~50 coins a minute: forget quiet ones sooner
+    TRADE_KEEP_DAYS = 7                            # ~1,300 paper trades an hour: prune stored trades after a week
     # signals the pump.fun API can't provide (no lifetime volume / trade count, no creator tax, no tick feed yet)
     UNAVAILABLE = frozenset({"volumeUsd", "tradeCount", "tpm1", "vol1m", "taxBps", "buyback", "buyRatio1m",
                              "netFlow1m", "buyers5m", "sellers5m", "whale1m", "volSpike", "devSoldUsd"})
@@ -43,6 +44,7 @@ else:
     FILE_PREFIX = "pons"
     TOKEN_URL = "https://robin.etherscan.io/token/"
     FORGET_IDLE_SEC = 7200
+    TRADE_KEEP_DAYS = 0                            # keep every trade
     UNAVAILABLE = PUMP_ONLY  # pons keeps exactly its original signal set
 
 

@@ -149,6 +149,12 @@ const LAB_META = {
   feedbackPenalty: ["Live failure penalty", "points", "Breeding fitness removed from close relatives of champions that failed live"],
   feedbackBonus: ["Live winner bonus", "points", "Breeding fitness added to close relatives of champions winning live"],
   duty: ["CPU share", "0-1", "Fraction of one CPU the lab may use (keep low on small servers)"],
+  provenSegments: ["Proven after", "stretches", "Stretches with trades (one per data refresh, ~90 min) a genome must be scored on, out of sample, before it can be proven"],
+  provenTrades: ["Proven: min trades", "#", "Out-of-sample trades needed before a genome can be proven"],
+  provenShare: ["Proven: stretches won", "0-1", "Share of its stretches a proven genome must have been profitable in"],
+  longRunWeight: ["Long-run breeding weight", "×", "How much the long-run record (avg return minus 1 std. error, %) adds to breeding fitness; 0 = ignore it"],
+  ledgerSize: ["Genomes tracked", "#", "How many genomes the long-run record follows (proven ones are never dropped)"],
+  ledgerAdd: ["New per refresh", "#", "Best genomes of each round that start being tracked"],
 };
 const POLL_META = {
   "poll.intervalSec": ["Poll interval", "s", "How often /api/launches?sort=active is fetched"],
@@ -192,7 +198,7 @@ $("#btnSaveSettings").onclick = async () => {
     const [a, b] = i.dataset.s.split(".");
     const v = i.type === "checkbox" ? i.checked : (i.value === "" ? null : Number(i.value));
     if (v === null) return;
-    (patch[a] ??= {})[b] = (a === "sizing" && b === "maxOpen") || ["population", "minTrades", "idleEpochs", "pages", "elite", "tournament", "minValTrades", "promoteCount", "maxGensPerData", "folds", "stressLatencyMs", "stressFeeBps"].includes(b) ? Math.round(v) : v;
+    (patch[a] ??= {})[b] = (a === "sizing" && b === "maxOpen") || ["population", "minTrades", "idleEpochs", "pages", "elite", "tournament", "minValTrades", "promoteCount", "maxGensPerData", "folds", "stressLatencyMs", "stressFeeBps", "ledgerSize", "ledgerAdd", "provenSegments", "provenTrades"].includes(b) ? Math.round(v) : v;
   });
   await api("/api/settings", patch);
   await refresh(); renderSettings();

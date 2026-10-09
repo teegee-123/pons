@@ -58,6 +58,24 @@ async function renderLab() {
   $("#labErr").innerHTML = esc(v.lastError || "") + `<span class="dim">${dropped}</span>`;
   $("#labLegend").innerHTML = `<span><i style="background:var(--series-1)"></i> Best fitness</span><span><i style="background:var(--series-2)"></i> Median fitness</span>`;
   labChart($("#labChart"), v.history || []);
+  const L = v.ledger || { rows: [] };
+  const span = L.first && L.last ? (L.last - L.first) / 86400 : 0;
+  $("#lrStats").innerHTML = stat("Forward data scored", L.segments ? `${fNum(span, span < 2 ? 1 : 0)} days · ${L.segments} stretches` : "–") +
+    stat("Genomes tracked", fNum(L.tracked || 0, 0)) + stat("Proven", `<span class="${L.proven ? "pos" : ""}">${fNum(L.proven || 0, 0)}</span>`) +
+    stat("Last scored", L.last ? new Date(L.last * 1000).toLocaleString() : "–");
+  const status = r => r.status === "proven" ? '<span class="tag manual">proven</span>'
+    : r.status === "losing" ? `<span class="tag">${r.wasProven ? "faded" : "losing"}</span>` : '<span class="tag">tracking</span>';
+  $("#lrTbl").innerHTML = `<tr><th>Strategy</th><th>Status</th><th class="n">Tracked</th><th class="n">Stretches won</th><th class="n">Trades</th><th class="n">Avg/trade</th><th class="n">Confidence</th><th class="n">Win</th><th>Cumulative</th><th>Live</th><th></th></tr>` +
+    (L.rows.map(r => `<tr><td><div class="desc">${esc(r.desc)}</div></td><td>${status(r)}</td>
+      <td class="n" data-tip="${r.seen} stretches scored, ${r.segs} with trades">${r.last ? fDur(r.last - r.since) : "–"}</td>
+      <td class="n">${r.segs ? `${r.pos}/${r.segs}` : "–"}</td><td class="n">${r.n}</td>
+      <td class="n ${cls(r.mean)}">${fPct(r.mean, 2)}</td>
+      <td class="n ${cls(r.lcb)}" data-tip="Average net return per trade minus one standard error">${r.lcb == null ? "–" : fP(r.lcb, 2)}</td>
+      <td class="n">${r.win == null ? "–" : fNum(r.win * 100, 0) + "%"}</td>
+      <td data-tip="Sum of net returns per trade, stretch by stretch">${sparkline(r.curve, 0)}</td>
+      <td>${liveCell(r.live, r.deployed)}</td>
+      <td>${r.deployed ? '<span class="tag manual">live</span>' : `<button class="btn" data-deploy="${esc(r.key)}">Deploy live</button>`}</td></tr>`).join("")
+      || `<tr><td colspan="11" class="empty">Nothing tracked yet. After each data refresh the lab starts tracking that round's best genomes; their record starts with the next refresh.</td></tr>`);
   const br = r => r ? `${r.n} · ${fPct(r.mean, 1)}` : "–";
   const folds = ds ? ds.folds : 4;
   $("#labHall").innerHTML = `<tr><th>Strategy</th><th class="n">Fitness</th><th class="n">Training</th><th class="n">Slices</th><th class="n">Validation</th><th class="n">Stress test</th><th>Live</th><th></th></tr>` +
@@ -73,14 +91,16 @@ async function renderLab() {
   $("#labTop").innerHTML = `<tr><th>Strategy</th><th class="n">Fitness</th><th class="n">Selection</th><th class="n">Filters</th><th class="n">Slices</th><th class="n">Trades</th><th class="n">Avg/trade</th><th class="n">P&L</th></tr>` +
     ((v.top || []).map(t => `<tr style="opacity:${t.clone ? 0.5 : 1}"><td><div class="desc">${esc(t.desc)}</div></td>
       <td class="n ${cls(t.fitness)}" data-tip="${esc(partsTip(t.parts))}">${fFit(t.fitness)}</td>
-      <td class="n" data-tip="Fitness used for breeding: minus ${t.similar} similar genomes${t.feedback ? `, ${fP(t.feedback, 1)} from live results` : ""}">${t.clone ? "clone" : fFit(t.sel)}</td>
+      <td class="n" data-tip="Fitness used for breeding: minus ${t.similar} similar genomes${t.feedback ? `, ${fP(t.feedback, 1)} from live results` : ""}${t.longrun ? `, ${fP(t.longrun, 1)} from the long-run record` : ""}">${t.clone ? "clone" : fFit(t.sel)}</td>
       <td class="n">${t.nfilters ?? "–"}</td><td class="n">${slices(t.consistency, folds)}</td>
       <td class="n">${t.train.n}</td><td class="n ${cls(t.train.mean)}">${fPct(t.train.mean)}</td>
       <td class="n ${cls(t.train.pnl)}">${fSUsd(t.train.pnl)}</td></tr>`).join("") || `<tr><td colspan="8" class="empty">Waiting for the first generation.</td></tr>`);
 }
-$("#labHall").addEventListener("click", async e => {
+const deployClick = async e => {
   const b = e.target.closest("[data-deploy]"); if (!b) return;
   const r = await api("/api/lab/deploy", { key: b.dataset.deploy });
   toast(r.added && r.added.length ? "Deployed: now paper trading live" : "Already live"); renderLab(); refresh();
-});
+};
+$("#labHall").addEventListener("click", deployClick);
+$("#lrTbl").addEventListener("click", deployClick);
 $("#btnLabRebuild").onclick = async () => { await api("/api/lab/rebuild", {}); toast("Reloading recorded data"); };

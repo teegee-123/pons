@@ -287,7 +287,8 @@ class Engine:
                     with self.lock:
                         lab.slip, lab.slip_n = self.live_slippage()
                     since = time.time() - lc["windowHours"] * 3600
-                    lab.build(snapshot_records(self.store.snapshot_lines(since)), yield_every=(1.0 - duty) / duty * 0.25)
+                    lab.build(snapshot_records(self.store.snapshot_lines(since)), yield_every=(1.0 - duty) / duty * 0.25,
+                              throttle=throttle)
                     lab.last_error = None
                     with self.lock:
                         k = self.cfg["evolution"]["shrinkK"]
@@ -787,7 +788,7 @@ class Engine:
             return []
         lc = self.cfg["lab"]
         if force_keys:
-            picks = [h for h in self.lab.hall if h["key"] in force_keys]
+            picks = self.lab.pick(force_keys)
         else:
             picks = self.lab.champions(int(lc["promoteCount"]))
         k = self.cfg["evolution"]["shrinkK"]
@@ -802,7 +803,7 @@ class Engine:
                 self._retire(autos[0], "replaced by a lab champion", time.time())
             spec = S.normalize({"kind": "auto", "filters": h["genome"]["filters"], "exits": h["genome"]["exits"],
                                 "gen": h.get("gen", 0), "origin": "lab"}, self.cfg["sizing"])
-            spec["name"] = f"L-{spec['id'][2:7]} g{h.get('gen', 0)}"
+            spec["name"] = f"LR-{spec['id'][2:7]}" if h.get("longrun") else f"L-{spec['id'][2:7]} g{h.get('gen', 0)}"
             self.runs[spec["id"]] = Run(spec)
             self.lab.deployed.add(h["key"])
             added.append(spec)
