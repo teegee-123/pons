@@ -154,11 +154,16 @@ nor real trades make sense on them (both can be switched back on under Settings 
 - **Mayhem mode.** The program moves these curves' virtual reserves without anyone trading (one lost 55% of its
   virtual SOL in 75 seconds while sellers took out 0.05 SOL), so constant-product pricing doesn't hold, and their
   real SOL reserves are a few dollars, far less than a position's paper value.
+- **Non-standard curves.** A standard curve keeps the same constant (30 SOL × 1,073M tokens) all the way up: 47,026
+  of 47,027 recorded states of normal coins did, against 2% of Mayhem coins' states. *Standard curve = yes* catches
+  Mayhem-like coins whose flag is missing.
 
 **Sell pricing.** A paper buy never reaches the chain, so the reserves read later don't contain it. Selling into
 them as they are would charge the price impact twice. On pump.fun a sell is priced on the curve as it would stand
 with our buy in it, so a round trip with nobody else trading returns what went in minus fees. For a $50 order
-that is 3% better than the double-counted price at launch, 0.9% near graduation (pons is unchanged).
+that is 3% better than the double-counted price at launch, 0.9% near graduation (pons is unchanged). This only
+applies while a position is a small part of the curve, as it always is on a standard curve; otherwise the plain
+price is used, which can never pay out more than the curve holds.
 
 **Winners must not rest on one trade.** pump.fun returns are fat-tailed: rugs at −90%, the odd +300% pump. In the
 first hour, the top 6 live strategies all owed their score to one +394% trade, and 31 of the 44 live strategies had

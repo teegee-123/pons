@@ -21,6 +21,7 @@ CURVE_TOKENS = 793_100_000          # tokens sold on the curve (real token reser
 LAUNCH_TOKENS = 1_073_000_000       # virtual token reserves at launch
 POOL_TOKENS = 206_900_000           # tokens kept back and paired with the raised quote at graduation
 SOL_CLOSE_PRICE = 115.005 / 279.9e6  # SOL per token when a SOL-paired curve completes
+STD_CURVE_K = 30.0 * LAUNCH_TOKENS   # virtual SOL x virtual tokens, the same all the way up every standard SOL curve
 
 _LIST = "/coins?offset=0&limit=60&sort=last_trade_timestamp&order=DESC&includeNsfw=true"
 DEFAULT_LISTS = ["/coins?limit=60", _LIST + "&complete=false", _LIST + "&complete=true"]
@@ -41,9 +42,11 @@ CONFIG = {
     #   order is many times the curve and neither paper fills nor real trades make sense;
     # - Mayhem mode: the program moves these curves' virtual reserves without trades (one lost 55% of its virtual
     #   SOL in 75 s while sellers took out 0.05 SOL), so constant-product pricing doesn't hold, and their real SOL
-    #   reserves are a few dollars, far less than a $50 position's paper value.
+    #   reserves are a few dollars, far less than a $50 position's paper value;
+    # - non-standard curves: the same thing on coins without the Mayhem flag. A standard curve keeps the constant
+    #   30 SOL x 1,073M tokens (47,026 of 47,027 recorded states of normal coins; 2% of Mayhem coins' states).
     "universe": {"quote": {"in": ["SOL"]}, "ageMin": {"min": None, "max": 1440}, "depthUsd": {"min": 1500, "max": None},
-                 "mayhem": {"in": ["no"]}},
+                 "mayhem": {"in": ["no"]}, "stdCurve": {"in": ["yes"]}},
     # Live evolution: pump.fun returns are fat-tailed (rugs at -90%, the odd +300% pump), so one trade must not make a
     # strategy a winner: scores leave out each strategy's best trade, only strategies with 6+ closed trades breed,
     # one parent has at most 3 live children, and strategies trading mostly the same coins as an older one retire.

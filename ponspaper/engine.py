@@ -25,7 +25,7 @@ from .store import open_store
 from .ticks import TickFeed
 from .lab import DEFAULT_LAB, Lab
 
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 HANDOFF_SEC = 300  # after start, how long to watch for the replaced instance's final save
 
 DEFAULT_CONFIG = {
@@ -76,7 +76,8 @@ FEAT_KEEP = ["ageMin", "mcapUsd", "progressPct", "chg1m", "chg5m", "chg15m", "tp
              "idleSec", "taxBps", "socials", "stage", "buyRatio1m", "netFlow1m", "buyers5m", "sellers5m", "whale1m",
              "volSpike", "devSoldUsd"]
 if V.PUMP:
-    FEAT_KEEP += ["inflow1m", "inflow5m", "fillRate", "athDdPct", "replies", "creatorCoins", "live", "mayhem", "depthUsd"]
+    FEAT_KEEP += ["inflow1m", "inflow5m", "fillRate", "athDdPct", "replies", "creatorCoins", "live", "mayhem", "depthUsd",
+                  "stdCurve"]
 
 
 def deep_merge(base, patch):
@@ -160,9 +161,10 @@ class Engine:
             if saved and saved.get("configVersion", 1) < 3:  # v3: a champion needs far more validation trades
                 self.cfg["lab"]["minValTrades"] = max(self.cfg["lab"].get("minValTrades", 0),
                                                       DEFAULT_CONFIG["lab"]["minValTrades"])
-            if V.PUMP and saved and saved.get("configVersion", 1) < 4:  # v4: pump.fun skips coins it can't price
-                for key in ("depthUsd", "mayhem"):
-                    self.cfg["universe"].setdefault(key, copy.deepcopy(DEFAULT_CONFIG["universe"][key]))
+            if V.PUMP and saved:  # pump.fun skips coins it can't price (v4: thin and Mayhem curves, v5: non-standard)
+                for ver, key in ((4, "depthUsd"), (4, "mayhem"), (5, "stdCurve")):
+                    if saved.get("configVersion", 1) < ver:
+                        self.cfg["universe"].setdefault(key, copy.deepcopy(DEFAULT_CONFIG["universe"][key]))
             self.cfg["configVersion"] = CONFIG_VERSION
         self.market = Market()
         self.runs = {}

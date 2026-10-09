@@ -40,6 +40,7 @@ FILTERS = {
     "depthUsd":    ("Curve depth", "$", "range", "Quote in the bonding curve's virtual reserve (the pool's, once graduated), USD. A normal pump.fun curve starts with 30 SOL; much less means a non-standard curve too thin to trade"),
     "live":        ("Livestream", "", "enum", "The creator is livestreaming on pump.fun right now"),
     "mayhem":      ("Mayhem mode", "", "enum", "Launched in pump.fun's Mayhem mode: an AI agent trades it and the curve is non-standard (often very thin)"),
+    "stdCurve":    ("Standard curve", "", "enum", "The bonding curve keeps pump.fun's standard constant (30 SOL x 1,073M tokens). Non-standard curves have their reserves moved by the program without trades, so they can't be priced"),
     "stage":       ("Stage", "", "enum", "curve = still on the bonding curve, graduated = trading in the DEX pool"),
     "quote":       ("Quote asset", "", "enum", f"{V.QUOTE}-paired or paired with another token"),
     "buyback":     ("Buyback", "", "enum", "Buyback-and-burn enabled"),
@@ -47,7 +48,7 @@ FILTERS = {
 # signals the venue can't provide are dropped, so they can't be filtered on, evolved or bucketed
 FILTERS = {k: v for k, v in FILTERS.items() if k not in V.UNAVAILABLE}
 ENUM_OPTIONS = {"stage": ["curve", "graduated"], "quote": [V.QUOTE, "OTHER"], "buyback": ["yes", "no"], "live": ["yes", "no"],
-                "mayhem": ["yes", "no"]}
+                "mayhem": ["yes", "no"], "stdCurve": ["yes", "no"]}
 
 EXIT_FIELDS = {
     "tpPct":       ("Take profit", "%", "Sell when the net return (after all fees, impact and gas) reaches this"),
@@ -297,6 +298,8 @@ def describe(spec):
         parts.append("live " + "/".join(f["live"]["in"]))
     if f.get("mayhem"):
         parts.append("mayhem " + "/".join(f["mayhem"]["in"]))
+    if f.get("stdCurve"):
+        parts.append("std curve " + "/".join(f["stdCurve"]["in"]))
     xs = [f"tp{ex.get('tpPct'):g}" if ex.get("tpPct") is not None else None,
           f"sl{ex.get('slPct'):g}" if ex.get("slPct") is not None else None,
           f"tr{ex.get('trailPct'):g}@{(ex.get('trailArmPct') or 0):g}" if ex.get("trailPct") is not None else None,

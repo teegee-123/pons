@@ -14,8 +14,10 @@ OWN_BUY_IN_RESERVES = V.PUMP
 
 def sell_gross(Q, T, tokens):
     """Quote out (before fees) for selling `tokens` that we bought earlier into reserves (Q, T)."""
-    if OWN_BUY_IN_RESERVES:
-        return tokens * Q / max(T - tokens, 0.1 * T)  # the reserve as it would stand with our buy in it
+    if OWN_BUY_IN_RESERVES and tokens <= 0.25 * T:  # on a normal curve a position is under 6% of the reserve
+        return tokens * Q / (T - tokens)  # the reserve as it would stand with our buy in it
+    # a bigger share means the program reset the reserves under us (non-standard curves, e.g. Mayhem): the
+    # counterfactual means nothing there, and the plain price can never pay out more than the reserve
     return tokens * Q / (T + tokens)
 
 

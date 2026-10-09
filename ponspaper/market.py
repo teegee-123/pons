@@ -4,6 +4,7 @@ import math
 from collections import deque
 
 from . import venue as V
+from .pumpfun import STD_CURVE_K
 
 TOKEN_SUPPLY = 1e9
 CURVE_V0_RATIO = 0.4   # virtual quote reserve at launch = 0.4 x graduation threshold (on-chain: 1.68 ETH vs 4.2 ETH)
@@ -239,6 +240,10 @@ class Token:
             out["depthUsd"] = math.sqrt(pool_k * p) * qu
         else:
             out["depthUsd"] = None
+        if curve and res and res[0] and res[1]:
+            out["stdCurve"] = "yes" if abs(res[0] * res[1] / STD_CURVE_K - 1.0) < 0.005 else "no"
+        else:
+            out["stdCurve"] = None if curve else "yes"  # graduated: priced on the modelled pool
         return out
 
 

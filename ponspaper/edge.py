@@ -40,6 +40,9 @@ BUCKETS = {
 }
 BUCKETS = {k: v for k, v in BUCKETS.items() if k not in V.UNAVAILABLE}
 GRID = ("ageMin", "mcapUsd")
+# Bumped when the way samples are valued changes, so a saved edge map built the old way starts again instead of
+# mixing. pump.fun 2: sells priced with our own buy in the curve, bounded on non-standard curves.
+PRICING = 2 if V.PUMP else 1
 
 
 def bucket(key, v):
@@ -197,10 +200,10 @@ class EdgeMap:
 
     def to_dict(self):
         return {"agg": self.agg, "grid": self.grid, "base": self.base, "samples": self.samples,
-                "horizons": self.cfg["horizonsMin"]}
+                "horizons": self.cfg["horizonsMin"], "pricing": PRICING}
 
     def load(self, d):
-        if not d or d.get("horizons") != self.cfg["horizonsMin"]:
+        if not d or d.get("horizons") != self.cfg["horizonsMin"] or d.get("pricing", 1) != PRICING:
             return
         try:
             for k in BUCKETS:
