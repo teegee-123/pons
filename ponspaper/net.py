@@ -93,7 +93,7 @@ class Client:
             except Exception:
                 pass
 
-    def request(self, method, url, body=None, headers=None):
+    def request(self, method, url, body=None, headers=None, parse=True):
         u = urllib.parse.urlsplit(url)
         host = u.hostname
         path = (u.path or "/") + ("?" + u.query if u.query else "")
@@ -118,7 +118,7 @@ class Client:
                     self.errors += 1
                     self._note(host, r.status)
                     raise HttpError(r.status)
-                return json.loads(raw)
+                return json.loads(raw) if parse else raw
             except HttpError as e:
                 if e.status not in RETRYABLE_STATUS:
                     raise
@@ -137,6 +137,9 @@ class Client:
 
     def get_json(self, url, headers=None):
         return self.request("GET", url, headers=headers)
+
+    def get_bytes(self, url, headers=None):
+        return self.request("GET", url, headers={"Accept": "*/*", **(headers or {})}, parse=False)
 
     def post_json(self, url, body, headers=None):
         return self.request("POST", url, body=body, headers=headers)

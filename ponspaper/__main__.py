@@ -2,6 +2,7 @@
 
   python -m ponspaper                 live paper trading + dashboard on http://127.0.0.1:8787
   python -m ponspaper replay          backtest/evolve strategies on recorded snapshots (data/snapshots)
+  python -m ponspaper export URL      save the best strategies, their rules and trade history from a running trader
 
 Set PONS_VENUE=pumpfun to trade pump.fun instead of pons (separate data folder and database tables).
 """
@@ -158,6 +159,12 @@ def cmd_ga(a):
     return 0
 
 
+def cmd_export(a):
+    from .export import export
+    export(a.url, a.out, a.recording)
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="ponspaper", description=f"{__doc__}\nvenue: {V.LABEL}",
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -181,7 +188,13 @@ def main(argv=None):
     g.add_argument("--population", type=int, default=80)
     g.add_argument("--top", type=int, default=10)
     g.add_argument("--seed", type=int, default=None)
+    x = sub.add_parser("export", help="save strategies, rules and trade history from a running trader (local or Render)")
+    x.add_argument("url", help="the trader's address, e.g. https://pumpfun-paper-trader.onrender.com")
+    x.add_argument("--out", default="exports", help="folder to write into (default: exports)")
+    x.add_argument("--recording", action="store_true", help="also download the recorded market data")
     a = p.parse_args(argv)
+    if a.cmd == "export":
+        return cmd_export(a)
     if a.cmd == "replay":
         return cmd_replay(a)
     if a.cmd == "ga":

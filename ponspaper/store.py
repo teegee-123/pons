@@ -21,8 +21,7 @@ from . import venue as V
 MAX_PENDING_SNAPS = 5000    # recording lines held while the database refuses writes (a few hours)
 MAX_PENDING_TRADES = 20000
 TRADE_FIELDS = ["exit_time", "strategy_id", "strategy", "kind", "symbol", "address", "entry_time", "hold_min",
-                "cost_usd", "proceeds_usd", "pnl_usd", "ret_pct", "reason", "entry_drift_pct", "fill_src",
-                "ageMin", "mcapUsd", "progressPct", "chg1m", "chg5m", "tpm1", "vol1m", "ddPeak", "taxBps", "socials"]
+                "cost_usd", "proceeds_usd", "pnl_usd", "ret_pct", "reason", "entry_drift_pct", "fill_src"] + V.TRADE_FEAT_COLS
 
 
 def open_store(data_dir):

@@ -65,7 +65,7 @@ PONS_SEEDS = [
 ]
 SEEDS = pumpfun.SEEDS if V.PUMP else PONS_SEEDS
 
-TRADE_FEAT_COLS = ["ageMin", "mcapUsd", "progressPct", "chg1m", "chg5m", "tpm1", "vol1m", "ddPeak", "taxBps", "socials"]
+TRADE_FEAT_COLS = V.TRADE_FEAT_COLS  # entry conditions saved with every closed trade
 FEAT_KEEP = ["ageMin", "mcapUsd", "progressPct", "chg1m", "chg5m", "chg15m", "tpm1", "vol1m", "ddPeak", "tradeCount",
              "idleSec", "taxBps", "socials", "stage", "buyRatio1m", "netFlow1m", "buyers5m", "sellers5m", "whale1m",
              "volSpike", "devSoldUsd"]

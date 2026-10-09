@@ -190,6 +190,31 @@ Deploy the same repo again (e.g. from another free Render account) with `PONS_VE
   are prefixed (`pons_*` / `pump_*`). Recordings are kept for 1 day (`PONS_DB_KEEP_DAYS=1`), about 150 MB.
 - **Solana RPC:** add `SOLANA_RPC_URL` with your private RPC URL (recommended).
 
+## Exporting strategies and trades
+
+One command pulls the best strategies, their exact rules and their trading history out of a running trader, pons or
+pump.fun, on Render or on this PC. It only reads, so nothing needs redeploying:
+
+```
+python -m ponspaper export https://pumpfun-paper-trader.onrender.com
+python -m ponspaper export https://<your-pons-service>.onrender.com --recording
+python -m ponspaper export http://127.0.0.1:8787
+```
+
+It writes `exports/<venue>_<date-time>/`:
+
+| File | Contents |
+|---|---|
+| `strategies.csv` | every live strategy ranked by score: trades, win rate, average return, P&L, drawdown, profit factor, fees, and its full rules as JSON |
+| `strategies.json` | everything: config, live strategies (rules, stats, equity curve, open positions, last 100 trades), hall of fame, lab champions (with their exam results) and the long-run record |
+| `hall_of_fame.csv` | best auto strategies seen, including retired ones |
+| `long_run.csv` | the lab's long-run record: forward-tested genomes, stretches won, trades, out-of-sample return and confidence |
+| `trades.csv` | every stored closed trade, all strategies, with the conditions at entry (pons: all trades; pump.fun: last 7 days) |
+| `recording.jsonl.gz` | with `--recording`: the recorded market data, for `replay` / `ga` on this PC |
+
+`trades.csv` joins to the strategies on `strategy_id`. A free Render service that is asleep takes up to a minute
+to answer the first request.
+
 ## Data
 
 Locally, data lives in `%LOCALAPPDATA%\ponspaper\data` (outside OneDrive, so it doesn't sync constantly). Override it with
