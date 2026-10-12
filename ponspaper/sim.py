@@ -62,8 +62,9 @@ def model_venue(d, ex):
     p = d.get("priceQuote")
     if d.get("stage") != "graduated" and d.get("reserves"):
         q, t, sellable = d["reserves"]
-        if q and t:
-            return Venue("curve", q, t, max(0.0, sellable or 0.0), ex["protocolFeeBps"], tax)
+        if q and t:  # pump.fun: the fee the coin's on-chain trades were charged, once the trade stream has seen one
+            fee = d["feeBps"] if d.get("feeBps") is not None else ex["protocolFeeBps"]
+            return Venue("curve", q, t, max(0.0, sellable or 0.0), fee, tax)
     if d.get("stage") == "graduated" and d.get("poolK") and p:
         mult = max(0.05, float(ex.get("gradLiquidityMult", 1.0)))
         kp = d["poolK"] * mult * mult

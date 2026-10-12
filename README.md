@@ -115,26 +115,70 @@ same way.
 trade. pump.fun launches about 50 coins a minute and a page covers only ~2 seconds of trading, so coins that
 slip through are re-read with `/coins-v2/{mint}`.
 
-**Fills read Solana.** When an order lands (`latencyMs` after the signal), the coin's bonding-curve account is
-read from Solana and the trade is quoted on those exact reserves: constant product on the virtual reserves, with
-the fees the program charges. Both were checked against real on-chain trades, which this maths reproduces to the
-token. Open positions are re-read from Solana every poll as well, so take profit / stop loss act on live chain
-state. The pump.fun API can lag a busy coin by several percent; the chain can't.
+**On-chain trade stream.** The trader follows every pump.fun bonding-curve trade, launch and graduation as it lands
+on Solana (`pumpstream.py`), like a bot on a chain feed, instead of relying on the 2-second API polls alone:
+- **Decisions on chain data.** Every 250 ms (*React every*), the coins that just traded have their exits and entries
+  checked on the curve after their latest trade. With polling alone, strategies acted on API data that could be
+  seconds old, and stop losses fired up to a poll late.
+- **Launches are tradeable at once**, from the launch transaction itself, before the API lists the coin.
+- **Fills and marks use the stream's curve state.** An order fills on the curve as it stands when it lands, with no
+  RPC round trip (`stream` in the Fills table). Coins the stream hasn't seen trade yet are still read from Solana.
+- **Each coin's own fee.** pump.fun charges 0.95% plus a creator fee that varies per coin: usually 0.30%, sometimes
+  0%, and some creators charge 1%. Once a coin's trade has been seen, its fills, marks and recordings use that fee.
+- **Per-trade signals** (the seven pons tick signals, Trades/min, Vol/min and four new ones, see Signals below).
+
+| Source | Used when | Behind the chain | Cost |
+|---|---|---|---|
+| Yellowstone gRPC | `SOLANA_GRPC_URL` is set (plus `SOLANA_GRPC_TOKEN` if the provider gives an x-token) | typically a few hundred ms | PublicNode: free with a token (`solana-yellowstone-grpc.publicnode.com:443`); others paid (e.g. Chainstack from $49/month); needs `grpcio` (in requirements.txt) |
+| Websocket `logsSubscribe` | otherwise: `SOLANA_WS_URL`, else the websocket of `SOLANA_RPC_URL`, else the public endpoint | about 0.8 s measured (median 1.3 s against block times rounded down to the second) | free |
+
+Both carry the same events: pump.fun logs a `TradeEvent` per trade with the curve's reserves after it, plus
+`CreateEvent` and `CompleteEvent` (layouts from pump.fun's IDL, checked against real transactions). Only events
+logged by the pump program itself count: any program can log look-alike data, and fake pump events are a known trick
+against trading bots. Measured on the websocket: about 38 trades a second, 0.2–0.3 MB/s received (roughly 15–25 GB a
+day) and about 3% of one CPU core for the whole trader.
+
+When the stream drops, goes quiet for 20 s or falls more than 5 s behind the chain, it reconnects. Meanwhile fills
+read Solana as before, and the per-trade signals stay empty until their windows have been watched again (the
+recording marks the outage, so the lab sees the same gaps). The pill next to *live* in the header shows the stream's
+state. *On-chain trade stream* under Settings → Polling turns it off. The public websocket allows one subscription per
+IP: a second one (say, a local trader next to a test) made the first fall a minute behind until it closed.
+
+If gRPC fails 3 times in a row without delivering anything (wrong token, endpoint down, a network that blocks it),
+the websocket takes over for 30 minutes, then gRPC is tried again; the pill says *gRPC unavailable* and why. The gRPC
+client speaks the Yellowstone protocol directly (no generated code) and was tested against a local server replaying
+real pump.fun transactions.
+
+**Setting the gRPC token.** On Render: the pump.fun service's Environment tab, `SOLANA_GRPC_URL` and
+`SOLANA_GRPC_TOKEN`. On this PC: a `.env` file at the repo root (git ignores it) with the same two lines, e.g.
+`SOLANA_GRPC_URL=solana-yellowstone-grpc.publicnode.com:443`; it is read at start-up and never overrides variables
+that are already set. Behind the Standard Bank proxy gRPC can't connect: the proxy re-signs TLS and only speaks
+HTTP/1.1, and gRPC needs HTTP/2 end to end, so the office network falls back to the websocket. At home or on Render,
+gRPC is used.
+
+**Fills read the chain.** When an order lands (`latencyMs` after the signal, give or take half of *Latency jitter*:
+a transaction lands in whichever ~400 ms slot it makes), it is quoted on the coin's curve right then: from the stream
+when it has watched the coin, else read from Solana. Pricing is constant product on the virtual reserves with the fees
+the program charges, which reproduces real on-chain trades to the token. Open positions are marked the same way, so
+take profit / stop loss act on live chain state. The pump.fun API can lag a busy coin by several percent; the chain
+can't.
 
 | Cost | How it is modelled on pump.fun |
 |---|---|
-| Curve fee | 1.25% on buys and sells (0.95% protocol + 0.30% creator, read from on-chain trade events) |
+| Curve fee | the coin's own: 0.95% protocol + its creator fee, from its on-chain trades; 1.25% until one has been seen |
 | Graduated (PumpSwap) | 1.25% by default. The real fee is tiered by market cap (about 1.15% at $200k, 0.3% above $20M) |
 | Solana fee | $0.05 per transaction (base + priority fee), reverted ones included |
-| Latency, slippage limits | as on pons |
+| Latency | 750 ms ± 200 ms (*Latency jitter* 400); the lab uses the average |
+| Slippage limits | as on pons |
 
 Set `SOLANA_RPC_URL` to a private RPC (a free Helius or QuickNode endpoint) for reliability; without it the
 public `api.mainnet-beta.solana.com` is used, which rate-limits and may refuse some cloud servers. If Solana
 can't be read, fills fall back to a fresh pump.fun API read (`api` in the Fills table), then to the last poll
 (`model`). The RPC URL is never saved in the config or shown on the dashboard.
 
-**Signals.** pump.fun's API has no lifetime volume or trade count and there is no tick feed yet, so *Trades/min*,
-*Vol/min*, *Lifetime volume/trades*, *Creator tax*, *Buyback* and the seven tick signals are hidden. In their place:
+**Signals.** pump.fun's API has no lifetime volume or trade count, so *Lifetime volume/trades*, *Creator tax* and
+*Buyback* are hidden. *Trades/min*, *Vol/min* and the seven tick signals (buy share, net flow, buyers, sellers,
+biggest buy, volume spike, creator sold) come from the trade stream and stay empty without it. pump.fun adds:
 
 | Signal | Meaning |
 |---|---|
@@ -145,6 +189,13 @@ can't be read, fills fall back to a fresh pump.fun API read (`api` in the Fills 
 | Replies | comments on the coin's page |
 | Creator's coins 24h | coins the same wallet launched in the last day (serial launchers), counted since start-up |
 | Curve depth | quote in the curve's virtual reserve (the pool's once graduated), USD; a normal curve starts at 30 SOL |
+| Holders | wallets holding the coin (trade stream) |
+| Creator holds | share of supply the creator's wallet still holds (trade stream) |
+| Top 10 hold | share of supply in the 10 biggest wallets, creator included, curve excluded (trade stream) |
+| Launch buys | share of supply wallets other than the creator bought in the first 3 s: snipers and bundled launches (trade stream) |
+
+The last four need every trade since launch, so they are only known for coins the stream has watched since launch.
+They stop at graduation, like the other per-trade signals: PumpSwap trades aren't streamed.
 
 **Coins it can't price are left out.** The default universe skips two kinds of coin, because neither paper fills
 nor real trades make sense on them (both can be switched back on under Settings → Trading universe):
@@ -190,10 +241,13 @@ results line up with live trading.
 
 **Recording.** Only coins in the trading universe (plus anything held) are recorded, in a compact form (curve
 reserves; price, market cap and progress are derived again on replay), and unchanged rows are skipped for 60 s.
+With the stream, each recorded coin's trades are recorded too (time, side, USD, wallet, tokens), and the curve after
+each burst of trades, so the lab trains on the same per-trade signals and price path that live trading saw. That
+roughly doubles the recording, from about 3 to 6 MB an hour.
 
 Limitations:
-- Graduated coins are not read from Solana. PumpSwap swaps don't follow constant product on the pool's vault
-  balances (checked against real swaps), so they fill on a fresh pump.fun API read with a modelled pool depth.
+- Graduated coins are not read from Solana or streamed. PumpSwap swaps don't follow constant product on the pool's
+  vault balances (checked against real swaps), so they fill on a fresh pump.fun API read with a modelled pool depth.
 - Coins paired with tokens other than SOL are outside the default universe and are not read from Solana.
 - Request load: about 3 requests/second to pump.fun plus about 1/second to Solana. If pump.fun starts refusing
   requests, raise the poll interval in Settings.

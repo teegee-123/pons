@@ -1,2 +1,4 @@
 # Only needed when DATABASE_URL is set (e.g. on Render). Local runs need no packages.
 psycopg[binary]>=3.2
+# Only needed for pump.fun's gRPC trade stream (SOLANA_GRPC_URL). Without it the free websocket stream is used.
+grpcio>=1.66

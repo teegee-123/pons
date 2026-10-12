@@ -12,6 +12,7 @@ from collections import Counter, deque
 from datetime import datetime
 
 from . import pumpfun
+from . import pumpstream
 from . import strategy as S
 from . import venue as V
 from .chain import Chain
@@ -35,6 +36,7 @@ DEFAULT_CONFIG = {
     "poll": {"intervalSec": 2.0, "pages": 1, "sort": "active", "refreshCap": 6, "heldRefreshSec": 60.0},
     "execution": {
         "latencyMs": 750,          # signal -> transaction landing
+        "latencyJitterMs": 0,      # each order lands up to half this earlier or later than latencyMs (pump.fun: a slot)
         "gasUsd": 0.02,            # per transaction (reverted ones too)
         "buySlippagePct": 10.0,    # minOut tolerance vs the quote at signal time; worse fills revert
         "sellSlippagePct": 40.0,
@@ -58,6 +60,7 @@ DEFAULT_CONFIG = {
              "fillLatency": False},  # buy at the first quote latencyMs after the signal (off on pons, see pumpfun.CONFIG)
     "record": {"enabled": True, "dedupeSec": 0},  # dedupeSec: skip a token's unchanged row for this long
     "ticks": {"enabled": True},
+    "stream": {"enabled": False, "source": "auto", "reactMs": 250},  # pump.fun's on-chain trade stream (pumpfun.CONFIG)
 }
 
 PONS_SEEDS = [
@@ -78,7 +81,7 @@ FEAT_KEEP = ["ageMin", "mcapUsd", "progressPct", "chg1m", "chg5m", "chg15m", "tp
              "volSpike", "devSoldUsd"]
 if V.PUMP:
     FEAT_KEEP += ["inflow1m", "inflow5m", "fillRate", "athDdPct", "replies", "creatorCoins", "live", "mayhem", "depthUsd",
-                  "stdCurve"]
+                  "stdCurve", "holders", "devHoldPct", "top10Pct", "launchBuyPct"]
 
 
 def deep_merge(base, patch):
@@ -148,6 +151,7 @@ class Engine:
         os.makedirs(data_dir, exist_ok=True)
         self.live = live
         self.rng = random.Random(seed)
+        self.lat_rng = random.Random(seed)  # order latency jitter, apart from evolution's random choices
         self.lock = threading.RLock()
         self.stopping = threading.Event()
         self.cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -178,10 +182,14 @@ class Engine:
         self.edge = EdgeMap(self.cfg["edge"], data_dir if live else None)
         self.status = {"startedAt": time.time(), "polls": 0, "pollErrors": 0, "lastPollAt": None, "lastPollMs": None,
                        "lastError": None, "gaps": 0, "refreshes": 0, "quoteUsd": None, "quote": V.QUOTE, "lastEquitySample": 0,
-                       "tickErrors": 0, "tickGaps": 0, "tickLastError": None, "tickCount": 0}
+                       "tickErrors": 0, "tickGaps": 0, "tickLastError": None, "tickCount": 0,
+                       "streamTicks": 0, "streamTickMs": None, "streamError": None, "streamOutages": 0}
         self.client = Client() if live else None
-        if live and V.PUMP:  # Solana reads for fills and open positions; no tick feed yet
+        self.stream = None   # pump.fun: on-chain trade stream (gRPC or websocket), see pumpstream.py
+        self._stream_up = False
+        if live and V.PUMP:  # Solana reads for fills and open positions; trades come from the stream
             self.chain, self.tickfeed = SolanaChain(self.client, solana_rpc_url()), None
+            self.stream = pumpstream.open_stream(self.cfg["stream"], self.client._proxy)
         else:  # Robinhood Chain: fill quotes and the tick feed
             self.chain = Chain(self.client, self.cfg["rpcUrl"], self.cfg["apiBase"]) if live else None
             self.tickfeed = TickFeed(self.client, self.cfg["rpcUrl"], self.cfg["apiBase"]) if live else None
@@ -332,6 +340,10 @@ class Engine:
         t.start()
         if self.lab is not None:
             threading.Thread(target=self._lab_loop, name="lab", daemon=True).start()
+        if V.PUMP:
+            if self.stream is not None:
+                self.stream.start()
+            threading.Thread(target=self._stream_loop, name="stream-react", daemon=True).start()
         return t
 
     def _lab_loop(self):
@@ -415,6 +427,8 @@ class Engine:
     def stop(self):
         self.stopping.set()
         self._lab_wake.set()
+        if self.stream is not None:
+            self.stream.stop()
         self._flush_recording(force=True)
         self.save_state()
 
@@ -435,6 +449,64 @@ class Engine:
                 self.save_state()
             self._flush_recording()
             self.stopping.wait(max(0.2, float(self.cfg["poll"]["intervalSec"]) - (time.time() - t0)))
+
+    def _stream_loop(self):
+        """pump.fun: every reactMs, apply the trades, launches and graduations the chain stream delivered and run
+        exits and entries on the coins they touched, so strategies react like a bot on a chain feed instead of
+        once per API poll."""
+        while not self.stopping.is_set():
+            t0 = time.time()
+            stream = self.stream
+            try:
+                if stream is not None:
+                    healthy = stream.healthy(t0)
+                    if self._stream_up and not healthy:  # trades are being missed: per-trade signals are unknown
+                        with self.lock:
+                            self.market.stop_ticks()
+                            if self.live and self.cfg["record"]["enabled"]:
+                                self._rec_buf.append(json.dumps({"t": round(t0, 2), "xs": 1}, separators=(",", ":")))
+                        self.status["streamOutages"] += 1
+                    self._stream_up = healthy
+                    trades, creates, completes, gap = stream.drain()
+                    if healthy and (trades or creates or completes or gap):
+                        self._stream_tick(trades, creates, completes, gap, time.time())
+                        self.status["streamTicks"] += 1
+                        self.status["streamTickMs"] = round((time.time() - t0) * 1000)
+            except Exception as e:
+                self.status["streamError"] = f"{_iso(time.time())} {e!r}"
+            react = max(50.0, float(self.cfg["stream"].get("reactMs") or 250)) / 1000.0
+            self.stopping.wait(max(0.02, react - (time.time() - t0)))
+
+    def _stream_tick(self, trades, creates, completes, gap, now):
+        with self.lock:
+            qu = self.status.get("quoteUsd")
+            known = self.market.tokens
+            items = {}
+            for c in creates:  # launches straight from the chain, before the API lists them
+                if c["mint"] not in known and qu:
+                    items[c["mint"]] = pumpfun.from_create(c, qu)
+            last = {}
+            for e in trades:
+                last[e["mint"]] = e
+            for m, e in last.items():
+                d = items.get(m) or (known[m].d if m in known else None)
+                if d is None:  # not listed yet: the API poll brings the coin in, its trades wait in the market
+                    continue
+                items[m] = pumpfun.apply_stream(d, e, e["t"])
+            for c in completes:
+                d = items.get(c["mint"]) or (known[c["mint"]].d if c["mint"] in known else None)
+                if d is not None and d.get("stage") != "graduated":
+                    items[c["mint"]] = pumpfun.graduate(d, c["t"])
+            self.tick(list(items.values()), now, listed=set(items), live_ticks=(trades, gap, True))
+
+    def _stream_state(self, d):
+        """pump.fun: token dict d with the stream's curve on top (the API's copy lags), or d itself."""
+        st = self.stream.curve(d.get("address")) if self.stream is not None else None
+        if st is None or d.get("stage") == "graduated":
+            return d
+        if st.get("complete"):
+            return pumpfun.graduate(d, st["t"])
+        return pumpfun.apply_stream(d, st, st["t"])
 
     def _fetch_lists(self):
         """-> (items, cover, errors). cover: [(list, lastTradeAt times, full page)] for each list ordered by last
@@ -479,7 +551,8 @@ class Engine:
         with self.lock:
             held = self._held_addrs()
             want = list(held) + [a for a in self.edge.due_addrs(time.time(), self.market) if a not in held]
-            ds = [tok.d for a in want if (tok := self.market.get(a)) is not None][:200]
+            ds = [tok.d for a in want if (tok := self.market.get(a)) is not None
+                  and (self.stream is None or self.stream.curve(a) is None)][:200]  # the stream already knows these
         if not ds:
             return {}
         try:
@@ -522,7 +595,8 @@ class Engine:
                 self._dirty |= held | self.edge.due_addrs(now, self.market)
             for a in held:
                 tok = self.market.get(a)
-                if a not in fresh and (tok is None or now - tok.updated > pc["heldRefreshSec"]):
+                if a not in fresh and (tok is None or now - tok.updated > pc["heldRefreshSec"]) and (
+                        self.stream is None or self.stream.curve(a) is None):
                     self._dirty.add(a)
             self._dirty |= {a for a in self.edge.due_addrs(now, self.market) if a not in fresh}
 
@@ -546,6 +620,8 @@ class Engine:
                     pass
         for a in fresh:
             self._dirty.discard(a)
+        if self.stream is not None and self.stream.healthy():  # the API's reserves lag the chain
+            items = [self._stream_state(d) for d in items]
         tick_res = None
         if tick_fut is not None:
             try:
@@ -575,8 +651,11 @@ class Engine:
                 if gap or not ok:
                     self.status["tickGaps"] += 1
                     self.market.start_ticks(now)  # coverage restarts: windows aren't complete any more
-                rec_ticks = self.market.add_ticks(raw, now) if ok else None
+                if ok:
+                    rec_ticks = self.market.add_stream_trades(raw, now) if V.PUMP else self.market.add_ticks(raw, now)
                 self.status["tickCount"] += len(rec_ticks or [])
+            elif tick_gap == "stop":  # replay: the trade stream was down from here on
+                self.market.stop_ticks()
             elif tick_rows is not None:
                 if tick_gap:
                     self.market.start_ticks(now)
@@ -587,6 +666,9 @@ class Engine:
                 uni, held = self.cfg["universe"], self._held_addrs()
                 rec_items = [d for d in items if (a := V.addr_key(d.get("address"))) in held
                              or (a in feats and S.passes(uni, feats[a]))]
+                if V.PUMP and rec_ticks:  # streamed trades only for the coins recorded
+                    keep = {V.addr_key(d.get("address")) for d in rec_items}
+                    rec_ticks = [r for r in rec_ticks if r[0] in keep]
             self._record(rec_items, now, rec_ticks, live_ticks is not None and (live_ticks[1] or not live_ticks[2]))
             if not self.live:
                 self.executor.process(now)
@@ -609,6 +691,8 @@ class Engine:
             if self.status.get("lastPrune", 0) < now - 300:
                 self.status["lastPrune"] = now
                 self.market.prune(now, self._held_addrs(), V.FORGET_IDLE_SEC)
+                if self.stream is not None:
+                    self.stream.prune(self._held_addrs())
 
     def _entries(self, cands, feats, now, ex):
         uni = self.cfg["universe"]
@@ -648,11 +732,18 @@ class Engine:
         run.last_entry[tok.addr] = now
         self.executor.submit({
             "id": oid, "sid": run.spec["id"], "side": "buy", "addr": tok.addr, "sym": d.get("symbol"),
-            "t_signal": now, "due": now + ex["latencyMs"] / 1000.0, "size_usd": size, "tokens": None, "pos_id": None,
+            "t_signal": now, "due": now + self._latency(ex), "size_usd": size, "tokens": None, "pos_id": None,
             "reason": "entry", "sig_spot_usd": spot_usd(d), "expected_out": exp_tokens,
             "tol": ex["buySlippagePct"] / 100.0, "stage": d.get("stage"),
             "feats": {k: (round(f[k], 4) if isinstance(f.get(k), float) else f.get(k)) for k in FEAT_KEEP},
         })
+
+    def _latency(self, ex):
+        """Signal -> landing, in seconds: latencyMs, give or take half of latencyJitterMs (a transaction lands in
+        whichever slot it makes; the lab uses the average)."""
+        lat = ex["latencyMs"] / 1000.0
+        jit = float(ex.get("latencyJitterMs") or 0) / 1000.0
+        return max(0.0, lat + jit * (self.lat_rng.random() - 0.5)) if jit > 0 else lat
 
     def _submit_sell(self, run, pos, reason, now, ex):
         tok = self.market.get(pos.addr)
@@ -663,7 +754,7 @@ class Engine:
         pos.exiting = True
         self.executor.submit({
             "id": S.new_id("o"), "sid": run.spec["id"], "side": "sell", "addr": pos.addr, "sym": pos.symbol,
-            "t_signal": now, "due": now + ex["latencyMs"] / 1000.0, "size_usd": None, "tokens": pos.tokens,
+            "t_signal": now, "due": now + self._latency(ex), "size_usd": None, "tokens": pos.tokens,
             "pos_id": pos.id, "reason": reason, "sig_spot_usd": spot_usd(d) if d else None, "expected_out": exp_q,
             "tol": 1.0 if force else ex["sellSlippagePct"] / 100.0, "stage": d.get("stage"),
         })
@@ -978,6 +1069,7 @@ class Engine:
                       storageError=getattr(self.store, "last_error", None),
                       executorError=self.executor.last_error,
                       chainCalls=self.chain.calls if self.chain else 0, chainFailures=self.chain.failures if self.chain else 0,
+                      stream=self.stream.view() if self.stream is not None else None,
                       httpRequests=self.client.requests if self.client else 0, httpErrors=self.client.errors if self.client else 0,
                       httpErrorKinds=dict(sorted(self.client.error_kinds.items(), key=lambda kv: -kv[1])[:6]) if self.client else {})
             tot = lambda xs, key: sum(x[key] or 0 for x in xs)
@@ -1042,12 +1134,20 @@ class Engine:
     # ------------------------------------------------------------------ mutations from the dashboard
     def update_settings(self, patch):
         with self.lock:
-            allowed = {"poll", "execution", "universe", "sizing", "evolution", "edge", "record", "lab"}
+            allowed = {"poll", "execution", "universe", "sizing", "evolution", "edge", "record", "lab", "stream"}
             patch = {k: v for k, v in (patch or {}).items() if k in allowed}
             if "universe" in patch:
                 patch["universe"] = S.clean_filters(patch["universe"])
             old_h, old_fill = list(self.cfg["edge"]["horizonsMin"]), self.cfg["edge"].get("fillLatency")
+            old_stream = (self.cfg["stream"].get("enabled"), self.cfg["stream"].get("source"))
             self.cfg = deep_merge(self.cfg, patch)
+            if V.PUMP and self.live and (self.cfg["stream"].get("enabled"), self.cfg["stream"].get("source")) != old_stream:
+                if self.stream is not None:
+                    self.stream.stop()
+                    self.market.stop_ticks()
+                self.stream = pumpstream.open_stream(self.cfg["stream"], self.client._proxy)
+                if self.stream is not None:
+                    self.stream.start()
             if self.cfg["edge"]["horizonsMin"] != old_h:
                 self.edge.reset_aggs()
             if self.cfg["edge"].get("fillLatency") != old_fill:  # samples bought the other way must not mix
@@ -1202,7 +1302,7 @@ def snapshot_items(paths):
 
 def snapshot_records(lines):
     """Yield (t, items, ticks, tick_gap) from recorded snapshot lines. ticks is None when the trade feed wasn't
-    running for that poll. Token metadata carries across files, so rows near an hour boundary aren't dropped.
+    running for that poll; tick_gap is True where it restarted and "stop" where it went down. Token metadata carries across files, so rows near an hour boundary aren't dropped.
     Rows are pons rows ("u") or compact pump.fun rows ("v")."""
     meta = {}
     last_t = None
@@ -1237,4 +1337,5 @@ def snapshot_records(lines):
             m = meta.get(row[0])
             if m is not None:
                 items.append(pumpfun.expand_row(row, m))
-        yield rec["t"], items, rec.get("x"), bool(rec.get("xg"))
+        # tick gap: True = the trade feed restarts here, "stop" = it was down from here on (pump.fun stream)
+        yield rec["t"], items, rec.get("x"), "stop" if rec.get("xs") else bool(rec.get("xg"))

@@ -18,3 +18,9 @@ services:
         sync: false
       - key: PONS_DB_SAVE_SEC  # how often state, trades and recordings are written to the database
         value: "900"
+      - key: SOLANA_RPC_URL    # private Solana RPC (e.g. a free Helius endpoint); its websocket also carries the trade stream
+        sync: false
+      - key: SOLANA_GRPC_URL   # optional: Yellowstone gRPC for the trade stream, e.g. solana-yellowstone-grpc.publicnode.com:443
+        sync: false
+      - key: SOLANA_GRPC_TOKEN # the gRPC provider's x-token, if it uses one
+        sync: false

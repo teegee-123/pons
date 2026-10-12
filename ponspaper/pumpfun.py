@@ -32,8 +32,10 @@ CONFIG = {
     "rpcUrl": None,                # Solana RPC comes from SOLANA_RPC_URL (see solana.py), never from the config
     "poll": {"intervalSec": 2.0, "refreshCap": 8, "heldRefreshSec": 5.0, "lists": DEFAULT_LISTS},
     "execution": {
+        "latencyJitterMs": 400,    # a transaction lands in whichever ~400 ms slot it makes: +-200 ms around latencyMs
         "gasUsd": 0.05,            # Solana base fee + priority fee / tip, per transaction
-        "protocolFeeBps": 125,     # bonding curve: 0.95% protocol + 0.30% creator
+        "protocolFeeBps": 125,     # bonding curve: 0.95% protocol + 0.30% creator, until a coin's own on-chain
+                                   # trades show its fee (some coins' creators charge 1%: 195 bps)
         "hookFeeBps": 125,         # PumpSwap after graduation: tiered by market cap, 1.25% for small coins
         "useChainQuotes": True,    # fill on the curve / pool read from Solana when the order lands
     },
@@ -63,6 +65,10 @@ CONFIG = {
     # so a free Postgres database holds a day or two of recordings
     "record": {"dedupeSec": 60, "universeOnly": True},
     "ticks": {"enabled": False},
+    # every curve trade, launch and graduation straight from Solana (pumpstream.py): gRPC when SOLANA_GRPC_URL is set,
+    # else the free websocket. Strategies decide, positions are marked and orders fill on the stream's curve state,
+    # reacting every reactMs instead of every poll.
+    "stream": {"enabled": True, "source": "auto", "reactMs": 250},
 }
 
 # Starter manual strategies, scaled to pump.fun (launch ~$3k market cap, graduation ~$45k at $110/SOL).
@@ -83,6 +89,13 @@ SPACE_VALUES = {
     "filters.mcapUsd.min": [3000, 4000, 5000, 7500, 10000, 15000, 25000],
     "filters.mcapUsd.max": [5000, 7500, 10000, 15000, 25000, 40000, 60000, 150000, 500000],
 }
+# the per-trade genes (trades/min, buyers, ...) are switched on less often in random genomes than on pons: pump.fun has
+# many more genes, and a random genome with too many filters never trades. On top of that, every filter gene's chance is
+# scaled so a random genome has as many filters on average as before the stream signals existed (FILTER_P_ON_TOTAL).
+FILTER_P_ON_TOTAL = 6.5
+SPACE_P_ON = {"filters.tpm1.min": 0.15, "filters.vol1m.min": 0.15, "filters.buyRatio1m.min": 0.15,
+              "filters.netFlow1m.min": 0.12, "filters.buyers5m.min": 0.15, "filters.sellers5m.max": 0.1,
+              "filters.whale1m.min": 0.1, "filters.volSpike.min": 0.12, "filters.devSoldUsd.max": 0.15}
 SPACE_EXTRA = [
     ("filters.progressPct.min", [5, 10, 20, 40, 60, 80], 0.3),
     ("filters.progressPct.max", [10, 20, 40, 60, 80, 95], 0.25),
@@ -96,6 +109,11 @@ SPACE_EXTRA = [
     ("filters.creatorCoins.max", [1, 2, 3, 5], 0.25),
     ("filters.live.in",         [["yes"], ["no"]], 0.1),
     ("filters.mayhem.in",       [["no"], ["yes"]], 0.2),
+    # on-chain trade stream: who holds the coin (coins watched since launch)
+    ("filters.holders.min",     [5, 10, 20, 40, 80, 150], 0.2),
+    ("filters.devHoldPct.max",  [0, 1, 3, 5, 10], 0.2),
+    ("filters.top10Pct.max",    [15, 20, 30, 40, 60], 0.2),
+    ("filters.launchBuyPct.max", [0, 2, 5, 10, 20], 0.15),
 ]
 
 
@@ -159,6 +177,46 @@ def normalize(x, partial=False):
     return d
 
 
+def from_create(ev, quote_usd):
+    """Token dict for a coin seen launching on chain (pumpstream CreateEvent), before the API lists it. Socials,
+    replies and the like follow once the API does."""
+    price = ev["Q"] / ev["T"]
+    curve = ev.get("curve")
+    supply = ev.get("supply") or 1e9
+    usd = price * quote_usd if quote_usd else None
+    return {
+        "address": ev["mint"], "symbol": ev.get("symbol"), "name": ev.get("name"), "createdAt": ev["t"],
+        "lastTradeAt": ev["t"], "stage": "curve", "priceQuote": price, "priceUsd": usd,
+        "marketCapUsd": usd * supply if usd else None, "quoteUsd": quote_usd, "raisedQuote": 0.0, "thresholdQuote": None,
+        "graduatedAt": None, "progress": max(0.0, min(1.0, 1.0 - ev["sellable"] / CURVE_TOKENS)), "volumeUsd": None,
+        "tradeCount": None, "creatorTaxBps": 0, "buybackEnabled": False, "curve": curve, "factory": None,
+        "decimals": 6, "deployer": ev.get("creator"), "supply": supply,
+        "quote": {"symbol": "SOL", "decimals": 9, "address": None}, "socials": {},
+        "reserves": [ev["Q"], ev["T"], ev["sellable"]], "poolK": None, "launchPriceQuote": price,
+        "athMcapUsd": None, "replies": None, "isLive": None, "mayhem": ev.get("mayhem"), "feeBps": None,
+    }
+
+
+def apply_stream(d, st, t):
+    """Token dict updated with the curve after its latest on-chain trade (pumpstream curve state), traded at t."""
+    n = apply_state(d, st, t)
+    n["lastTradeAt"] = max(t, d.get("lastTradeAt") or 0)
+    if st.get("feeBps") is not None:
+        n["feeBps"] = st["feeBps"]
+    return n
+
+
+def graduate(d, now):
+    """Token dict for a coin whose curve just completed (pumpstream CompleteEvent): it trades on PumpSwap from now on,
+    in a pool opened at the curve's closing price."""
+    n = dict(d)
+    res = d.get("reserves")
+    close = res[0] / res[1] if res and res[0] and res[1] else SOL_CLOSE_PRICE
+    n.update(stage="graduated", reserves=None, progress=1.0, poolK=close * POOL_TOKENS * POOL_TOKENS, priceQuote=close,
+             lastTradeAt=now)
+    return n
+
+
 def apply_state(d, st, now):
     """Token dict updated with its bonding curve as read from Solana (see solana.SolanaChain.states)."""
     n = dict(d)
@@ -187,14 +245,16 @@ def record_meta(d):
 
 def record_row(d):
     """Compact recording row; everything else is derived again on replay (see expand_row).
-    curve:     [mint, "c", lastTradeAt, quoteUsd, athMcapUsd, replies, live, Q, T, sellable]
-    graduated: [mint, "g", lastTradeAt, quoteUsd, athMcapUsd, replies, live, priceQuote, poolK]"""
+    curve:     [mint, "c", lastTradeAt, quoteUsd, athMcapUsd, replies, live, Q, T, sellable(, feeBps)]
+    graduated: [mint, "g", lastTradeAt, quoteUsd, athMcapUsd, replies, live, priceQuote, poolK]
+    feeBps: the curve fee the coin's on-chain trades were charged (protocol + its creator fee), once known."""
     live = d.get("isLive")
     head = [d["address"], "g" if d.get("stage") == "graduated" else "c",
             round(d["lastTradeAt"], 1) if d.get("lastTradeAt") else None, _sig(d.get("quoteUsd")),
             _sig(d.get("athMcapUsd")), d.get("replies"), None if live is None else int(bool(live))]
     if head[1] == "c":
-        return head + [_sig(x) for x in (d.get("reserves") or [None, None, None])]
+        row = head + [_sig(x) for x in (d.get("reserves") or [None, None, None])]
+        return row + [d["feeBps"]] if d.get("feeBps") is not None else row
     return head + [_sig(d.get("priceQuote"), 9), _sig(d.get("poolK"))]
 
 
@@ -208,6 +268,7 @@ def expand_row(row, meta):
         price, d["poolK"], d["reserves"] = row[7], row[8], None
     else:
         d["reserves"], d["poolK"] = row[7:10], None
+        d["feeBps"] = row[10] if len(row) > 10 else None
         price = row[7] / row[8] if row[7] and row[8] else None
         raised = row[7] - lp * LAUNCH_TOKENS if row[7] and lp else None  # virtual minus launch virtual quote
     sellable = None if graduated else row[9]

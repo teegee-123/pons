@@ -21,9 +21,11 @@ def _pick(raw):
 NAME = _pick(os.environ.get("PONS_VENUE"))
 PUMP = NAME == "pumpfun"
 
-# signals built from pump.fun data (reserves between polls, all-time high, livestreams, replies, creator wallet)
+# signals built from pump.fun data (reserves between polls, all-time high, livestreams, replies, creator wallet) and,
+# for coins the on-chain trade stream has watched since launch, from every trade (holders, creator's and top wallets'
+# share of supply, supply bought by others in the launch's first seconds)
 PUMP_ONLY = frozenset({"inflow1m", "inflow5m", "fillRate", "athDdPct", "live", "replies", "creatorCoins", "mayhem",
-                       "depthUsd", "stdCurve"})
+                       "depthUsd", "stdCurve", "holders", "devHoldPct", "top10Pct", "launchBuyPct"})
 
 if PUMP:
     LABEL = "pump.fun"
@@ -36,10 +38,12 @@ if PUMP:
     # entry conditions saved with every closed trade (trades.csv)
     TRADE_FEAT_COLS = ["ageMin", "mcapUsd", "progressPct", "chg1m", "chg5m", "chg15m", "ddPeak", "idleSec", "socials",
                        "inflow1m", "inflow5m", "fillRate", "athDdPct", "replies", "creatorCoins", "live", "mayhem", "depthUsd",
-                       "stdCurve"]
-    # signals the pump.fun API can't provide (no lifetime volume / trade count, no creator tax, no tick feed yet)
-    UNAVAILABLE = frozenset({"volumeUsd", "tradeCount", "tpm1", "vol1m", "taxBps", "buyback", "buyRatio1m",
-                             "netFlow1m", "buyers5m", "sellers5m", "whale1m", "volSpike", "devSoldUsd"})
+                       "stdCurve", "tpm1", "vol1m", "buyRatio1m", "netFlow1m", "buyers5m", "sellers5m", "whale1m", "volSpike",
+                       "devSoldUsd", "holders", "devHoldPct", "top10Pct", "launchBuyPct"]
+    # signals pump.fun can't provide: no lifetime volume / trade count, no creator tax or buyback. The per-trade signals
+    # (trades/min, buyers, creator sold, holders, ...) come from the on-chain trade stream (pumpstream.py) and stay
+    # empty while it isn't running.
+    UNAVAILABLE = frozenset({"volumeUsd", "tradeCount", "taxBps", "buyback"})
 else:
     LABEL = "pons"
     QUOTE = "ETH"

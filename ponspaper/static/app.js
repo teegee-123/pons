@@ -87,10 +87,37 @@ function renderHeader() {
   $("#liveTxt").parentElement.dataset.tip = esc(st.lastError || "") + `<br>polls ${st.polls}, errors ${st.pollErrors}, coverage gaps ${st.gaps}, direct refreshes ${st.refreshes}<br>chain quote calls ${st.chainCalls} (failed ${st.chainFailures})` +
     (st.httpErrors ? `<br>HTTP errors ${st.httpErrors}: ${Object.entries(st.httpErrorKinds || {}).map(([k, n]) => `${esc(k)} ×${n}`).join(", ")}` : "") + (st.handoffs ? `<br>took over from the previous instance at ${fTime(st.lastHandoffAt)}` : "") + `<br>storage: ${esc(st.storage)}` + (st.memMB ? ` · memory ${st.memMB} MB (peak ${st.memPeakMB})` : "") +
     (st.storageError ? " — " + esc(st.storageError) : "") + (st.executorError ? "<br>" + esc(st.executorError) : "");
+  renderStream(st);
   const k = (label, val, c = "") => `<div class="kpi"><b class="${c}">${val}</b><span>${label}</span></div>`;
   $("#kpis").innerHTML = k("manual strategies P&L", fSUsd(t.manualPnl), cls(t.manualPnl)) + k("all strategies P&L", fSUsd(t.allPnl), cls(t.allPnl)) +
     k("closed trades", fNum(t.trades, 0)) + k("open positions", fNum(t.open, 0)) + k("tokens tracked", fNum(st.tokens, 0)) +
     k(st.quote || "ETH", fUsd(st.quoteUsd ?? st.ethUsd, 0)) + k(`epoch ${ev.epoch} · next evolve`, S.state.cfg.evolution.enabled ? fDur(ev.nextEpochIn) : "off");
+}
+
+// pump.fun: the on-chain trade stream (gRPC or websocket) that marks, fills and per-trade signals run on
+function renderStream(st) {
+  const s = st.stream, pill = $("#streamPill");
+  const on = S.meta.venue.id === "pumpfun" && S.state.cfg.stream && S.state.cfg.stream.enabled;
+  pill.classList.toggle("hidden", !on);
+  if (!on) return;
+  if (!s) {
+    $("#streamDot").className = "dot bad";
+    $("#streamTxt").textContent = "chain feed: not configured";
+    pill.dataset.tip = "gRPC needs SOLANA_GRPC_URL (and the grpcio package). Without a stream, signals that need individual trades stay empty.";
+    return;
+  }
+  $("#streamDot").className = "dot " + (s.healthy ? "ok" : "bad");
+  const src = s.source + (s.note ? " (gRPC unavailable)" : "");
+  $("#streamTxt").textContent = s.healthy
+    ? `chain ${src} · ${s.tradesPerSec == null ? "…" : fNum(s.tradesPerSec, 0) + " trades/s"} · ${s.lagSec == null ? "…" : fNum(s.lagSec, 1) + "s behind"}`
+    : `chain ${src}: ${s.connected ? "quiet" : "reconnecting"}`;
+  pill.dataset.tip = (s.note ? esc(s.note) + "<br>" : "") +
+    `Every pump.fun curve trade, launch and graduation from Solana${s.host ? " via " + esc(s.host) : ""}. ` +
+    `Strategies decide, positions are marked and orders fill on it, every ${S.state.cfg.stream.reactMs} ms.` +
+    `<br>events ${fNum(s.events, 0)} · trades ${fNum(s.trades, 0)} · coins tracked ${fNum(s.curves, 0)} · ${fNum(s.mbIn, 0)} MB received` +
+    `<br>behind the chain: ${s.lagSec == null ? "–" : fNum(s.lagSec, 2) + " s"} (block times have 1 s resolution, so about half a second of this is rounding)` +
+    `<br>reconnects ${s.reconnects}, outages ${st.streamOutages}, reaction pass ${st.streamTickMs ?? "–"} ms` +
+    (s.lastError ? "<br>last error: " + esc(s.lastError) : "") + (st.streamError ? "<br>" + esc(st.streamError) : "");
 }
 
 // ---------- leaderboard ----------

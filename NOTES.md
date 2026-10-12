@@ -22,11 +22,22 @@ Recordings are no longer deleted automatically, so each download holds everythin
   data from there before the database fills up. A full database refuses every write, including the saved state.
 - `PONS_DB_KEEP_DAYS` is no longer read. You can remove it from each Render service's Environment tab.
 
-## 3. Bigger project: on-chain trade signals for pump.fun
+## 3. On-chain trade stream for pump.fun: next steps
 
-pump.fun's API doesn't carry what predicts rugs: developer selling, unique buyers, sniper or bundled buys at launch,
-top-holder share. Reading individual trades from Solana (like the pons tick feed) would add them. A multi-day job;
-first check what a free source (Solana RPC logs for the pump program, or a public trade websocket) allows.
+The stream (README → pump.fun → On-chain trade stream) is in: per-trade signals, holders, fills and marks on chain
+state, 250 ms reactions, per-coin fees. Still open:
+
+- **Turn on gRPC on Render.** PublicNode's free endpoint: set `SOLANA_GRPC_URL=solana-yellowstone-grpc.publicnode.com:443`
+  and `SOLANA_GRPC_TOKEN` in the pump.fun service's Environment tab (the local copy is in the git-ignored `.env`).
+  The office proxy blocks gRPC, so it has only been tested against a local server replaying real transactions.
+  Check the header pill says "chain gRPC" without "(gRPC unavailable)", and that the lag drops below the
+  websocket's ~1.3 s.
+- **Check the free websocket on Render.** The public endpoint may refuse cloud servers. If the pill keeps saying
+  "reconnecting", add a free Helius key as `SOLANA_RPC_URL` (its websocket is used automatically).
+- **Stream PumpSwap too.** Graduated coins still fill on the API with a modelled pool, and their per-trade signals
+  stop at graduation. PumpSwap logs `BuyEvent`/`SellEvent` with pool reserves (pump_amm IDL).
+- **Priority fees in SOL.** `gasUsd` is a flat $0.05. Real bots pay a priority fee and often a Jito tip in SOL, more
+  when competing for the same slot.
 
 ## Smaller follow-ups found along the way
 

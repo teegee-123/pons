@@ -36,6 +36,10 @@ async function renderMarket() {
     ["mayhem", "Mayhem", "launched in Mayhem mode", t => `<td class="n">${t.mayhem === "yes" ? "mayhem" : ""}</td>`],
     ["replies", "Replies", "", t => `<td class="n">${t.replies ?? "–"}</td>`],
     ["creatorCoins", "Dev coins", "coins this creator launched in 24h", t => `<td class="n ${t.creatorCoins > 1 ? "neg" : ""}">${t.creatorCoins ?? "–"}</td>`],
+    ["holders", "Holders", "wallets holding it (chain stream, coins watched since launch)", t => `<td class="n">${t.holders ?? "–"}</td>`],
+    ["devHoldPct", "Dev holds", "creator's share of supply (chain stream)", t => `<td class="n">${t.devHoldPct == null ? "–" : fNum(t.devHoldPct, 1) + "%"}</td>`],
+    ["top10Pct", "Top 10", "share of supply held by the 10 biggest wallets (chain stream)", t => `<td class="n ${t.top10Pct > 40 ? "neg" : ""}">${t.top10Pct == null ? "–" : fNum(t.top10Pct, 0) + "%"}</td>`],
+    ["launchBuyPct", "Launch buys", "supply others bought in the first 3 s: snipers and bundles (chain stream)", t => `<td class="n ${t.launchBuyPct > 10 ? "neg" : ""}">${t.launchBuyPct == null ? "–" : fNum(t.launchBuyPct, 1) + "%"}</td>`],
     ["tradeCount", "Trades", "", t => `<td class="n">${fNum(t.tradeCount, 0)}</td>`],
     ["taxBps", "Tax", "", t => `<td class="n">${t.taxBps}</td>`],
     ["socials", "Socials", "", t => `<td class="n">${t.socials}</td>`],
@@ -104,6 +108,7 @@ async function renderTrades() {
 // ---------- settings ----------
 const EX_META = {
   latencyMs: ["Latency", "ms", "Delay from the strategy seeing data to the transaction executing. Fills use on-chain state at that moment."],
+  latencyJitterMs: ["Latency jitter", "ms", "Each order lands up to half this earlier or later than the latency (0 = always exactly the latency)"],
   gasUsd: ["Gas per tx", "$", "Charged on every transaction, including reverted ones"],
   buySlippagePct: ["Buy slippage limit", "%", "Buy reverts if it would get this much fewer tokens than quoted at signal time"],
   sellSlippagePct: ["Sell slippage limit", "%", "Sell reverts beyond this; after 3 failed sells the position is dumped at any price"],
@@ -171,9 +176,10 @@ const fld = (id, [l, u, h], v) => `<label data-tip="${esc(h)}">${esc(l)} <span c
 const chk = (id, l, h, v) => `<label data-tip="${esc(h)}">${esc(l)}</label><input type="checkbox" data-s="${id}" ${v ? "checked" : ""}>`;
 // pump.fun wording for the fields whose meaning depends on the venue
 const PUMP_META = {
-  "execution.latencyMs": ["Latency", "ms", "Delay from the strategy seeing data to the transaction executing. Fills use the bonding curve read from Solana at that moment."],
+  "execution.latencyMs": ["Latency", "ms", "Delay from the strategy seeing data (a trade arriving on the chain stream, or a poll) to its transaction landing. Fills use the bonding curve at that moment."],
+  "execution.latencyJitterMs": ["Latency jitter", "ms", "A transaction lands in whichever ~400 ms slot it makes: each order lands up to half this earlier or later than the latency. The lab uses the average"],
   "execution.gasUsd": ["Fee per tx", "$", "Solana base + priority fee (or tip), charged on every transaction including reverted ones"],
-  "execution.protocolFeeBps": ["Curve fee", "bps", "Bonding-curve fee on buys and sells: 0.95% protocol + 0.30% creator = 125"],
+  "execution.protocolFeeBps": ["Curve fee", "bps", "Bonding-curve fee on buys and sells: 0.95% protocol + 0.30% creator = 125. Used until the chain stream has seen one of the coin's own trades, whose fee then applies (some coins charge more or less)"],
   "execution.hookFeeBps": ["Graduated pool fee", "bps", "PumpSwap fee after graduation (dynamic; about 1.25% at low market caps)"],
   "execution.gradLiquidityMult": ["Graduated depth ×", "", "Scales the modelled PumpSwap pool depth (seeded with the curve's closing price and 206.9M tokens)"],
   "poll.intervalSec": ["Poll interval", "s", "How often the pump.fun lists (newest, curve and graduated coins by last trade) are fetched"],
@@ -183,7 +189,7 @@ function renderSettings() {
   const c = S.state.cfg, pump = S.meta.venue.id === "pumpfun";
   $("#uniForm").innerHTML = filterForm(c.universe, "uni");
   $("#exForm").innerHTML = Object.entries(EX_META).map(([k, m]) => fld("execution." + k, vmeta("execution." + k, m), c.execution[k])).join("") +
-    (pump ? chk("execution.useChainQuotes", "Fill on live Solana state", "Each order reads the coin's bonding curve from Solana when it lands (graduated coins: a fresh pump.fun API read); off = fill on the last poll", c.execution.useChainQuotes)
+    (pump ? chk("execution.useChainQuotes", "Fill on live Solana state", "Each order fills on the coin's bonding curve when it lands: the curve after its latest trade on the chain stream, else read from Solana (graduated coins: a fresh pump.fun API read); off = fill on the last poll", c.execution.useChainQuotes)
       : chk("execution.useChainQuotes", "Fill on live on-chain quotes", "Off = fill from API data with the curve model (latency then has little effect)", c.execution.useChainQuotes));
   $("#sizeForm").innerHTML = Object.entries(S.meta.sizing).map(([k, d]) => fld("sizing." + k, [d.label, d.unit, d.help], c.sizing[k])).join("");
   $("#evoForm").innerHTML = chk("evolution.enabled", "Evolution on", "Retire losers and breed winners every epoch", c.evolution.enabled) +
@@ -196,7 +202,9 @@ function renderSettings() {
   $("#pollForm").innerHTML = Object.entries(POLL_META).filter(([k]) => !(pump && k === "poll.pages")).map(([k, m]) => { const [a, b] = k.split("."); return fld(k, vmeta(k, m), c[a][b]); }).join("") +
     chk("edge.enabled", "Edge map sampling", "Collect forward-return samples", c.edge.enabled) +
     chk("edge.fillLatency", "Edge buys wait for latency", "Each sample buys like a real order: at the first quote after the order latency, not at the price that triggered it. Changing it restarts the edge map", c.edge.fillLatency) +
-    chk("record.enabled", "Record snapshots", "Write every poll to data/snapshots for backtests", c.record.enabled);
+    chk("record.enabled", "Record snapshots", "Write every poll to data/snapshots for backtests", c.record.enabled) +
+    (pump ? chk("stream.enabled", "On-chain trade stream", "Every curve trade, launch and graduation from Solana: Yellowstone gRPC when SOLANA_GRPC_URL is set, else the free websocket (SOLANA_WS_URL, SOLANA_RPC_URL or the public endpoint). Strategies react to it, fills and marks use it, and it feeds the per-trade signals", c.stream.enabled) +
+      fld("stream.reactMs", ["React every", "ms", "How often new chain trades are applied: exits and entries run on the coins that traded"], c.stream.reactMs) : "");
   $("#setMsg").textContent = "";
   renderStorage();
 }

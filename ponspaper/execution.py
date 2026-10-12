@@ -2,8 +2,8 @@
 
 LiveExecutor: each order waits `latencyMs` after the signal, then is quoted against live on-chain state (curve
 reserves or the v4 quoter) and checked against the slippage limit, like a real transaction with minOut. On
-pump.fun the live state is the coin's bonding curve / PumpSwap pool read from Solana (then a fresh pump.fun API
-read if Solana can't be reached).
+pump.fun the live state is the coin's bonding curve after its latest trade on the chain stream (pumpstream.py), else
+the curve read from Solana, else a fresh pump.fun API read.
 ReplayExecutor: for backtests on recorded data; fills at the first recorded snapshot at/after the due time.
 """
 import heapq
@@ -37,6 +37,15 @@ def fill_with_venue(o, v, qu, ex, t):
     return _result(True, t, v.src, out=out, spot=v.spot, qu=qu, fee_frac=v.fee_frac)
 
 
+def _fee(st, d, ex):
+    """pump.fun curve fee in bps: what the coin's latest on-chain trade was charged (protocol + its creator fee), else
+    the configured default."""
+    for src in (st, d):
+        if src is not None and src.get("feeBps") is not None:
+            return src["feeBps"]
+    return ex["protocolFeeBps"]
+
+
 class LiveExecutor:
     def __init__(self, engine):
         self.engine = engine
@@ -64,7 +73,10 @@ class LiveExecutor:
                 if not self.heap:
                     self.cv.wait(0.5)
                     continue
-                lead = self.rpc_rtt / 2 if self.engine.cfg["execution"].get("useChainQuotes", True) else 0.0
+                # a chain read takes a round trip, so it starts half of one early; the stream's state needs no read
+                stream = self.engine.stream
+                lead = (self.rpc_rtt / 2 if self.engine.cfg["execution"].get("useChainQuotes", True)
+                        and not (stream is not None and stream.healthy()) else 0.0)
                 wait = self.heap[0][0] - lead - time.time()
                 if wait > 0:
                     self.cv.wait(min(wait, 0.5))
@@ -103,17 +115,36 @@ class LiveExecutor:
         return results
 
     def _solana_fill(self, orders, toks, results, ex):
-        """pump.fun: quote against the coin's bonding curve / PumpSwap pool as read from Solana right now."""
+        """pump.fun: quote against the coin's bonding curve as it stands right now: after its latest trade on the
+        chain stream when the stream has watched it since, else read from Solana."""
         ds = {o["addr"]: toks[i].d for i, o in enumerate(orders) if toks[i] is not None}
-        t0 = time.time()
-        states = self.engine.chain.states(list(ds.values()))
-        t = self._read_time(t0)
+        stream = self.engine.stream
+        now = time.time()
+        rest = {}
         for i, o in enumerate(orders):
             d = ds.get(o["addr"])
+            if d is None:
+                continue
+            st = stream.curve(d["address"]) if stream is not None else None
+            if st is not None and st.get("complete"):  # moved to PumpSwap: filled from a fresh API read
+                continue
+            if st is not None and d.get("stage") != "graduated":
+                v = Venue("curve", st["Q"], st["T"], st["sellable"], _fee(st, d, ex), d.get("creatorTaxBps") or 0,
+                          src="stream")
+                results[i] = fill_with_venue(o, v, d.get("quoteUsd"), ex, now)
+            else:
+                rest[d["address"]] = d
+        if not rest:
+            return
+        t0 = time.time()
+        states = self.engine.chain.states(list(rest.values()))
+        t = self._read_time(t0)
+        for i, o in enumerate(orders):
+            d = rest.get(o["addr"])
             st = states.get(d["address"]) if d else None
             if st is None:  # graduated or unreadable: filled from a fresh API read instead
                 continue
-            v = Venue("curve", st["Q"], st["T"], st["sellable"], ex["protocolFeeBps"], d.get("creatorTaxBps") or 0,
+            v = Venue("curve", st["Q"], st["T"], st["sellable"], _fee(None, d, ex), d.get("creatorTaxBps") or 0,
                       src="chain")
             results[i] = fill_with_venue(o, v, d.get("quoteUsd"), ex, t)
 

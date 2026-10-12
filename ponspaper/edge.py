@@ -41,6 +41,10 @@ BUCKETS = {
     "replies":     [1, 5, 20],
     "creatorCoins": [2, 3, 5],
     "depthUsd":    [1500, 4000, 6000, 9000, 12000],
+    "holders":     [5, 15, 40, 100],
+    "devHoldPct":  [0.01, 2, 5, 10],
+    "top10Pct":    [15, 25, 40, 60],
+    "launchBuyPct": [0.01, 3, 10, 25],
 }
 BUCKETS = {k: v for k, v in BUCKETS.items() if k not in V.UNAVAILABLE}
 GRID = ("ageMin", "mcapUsd")

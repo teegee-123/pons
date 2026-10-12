@@ -1,10 +1,12 @@
 """Token state + rolling history, and the features strategies filter on."""
 import bisect
+import heapq
 import math
 from collections import deque
 
 from . import venue as V
 from .pumpfun import STD_CURVE_K
+from .pumpstream import WALLET_CHARS
 
 TOKEN_SUPPLY = 1e9
 CURVE_V0_RATIO = 0.4   # virtual quote reserve at launch = 0.4 x graduation threshold (on-chain: 1.68 ETH vs 4.2 ETH)
@@ -12,6 +14,9 @@ HIST_SEC = 1800        # keep 30 minutes of samples per token
 SAMPLE_EVERY = 15      # add a sample at least this often even if nothing changed
 TICK_SEC = 900         # keep 15 minutes of individual trades per token
 TICK_KEYS = ("buyRatio1m", "netFlow1m", "buyers5m", "sellers5m", "whale1m", "volSpike", "devSoldUsd")
+LAUNCH_SEC = 3.0       # pump.fun: buys this soon after launch count as sniper / bundled launch buys
+ORPHAN_SEC = 120       # pump.fun: trades of coins the market doesn't know yet are kept this long
+BORN_SEC = 10          # pump.fun: a coin first seen this soon after launch has been watched since launch
 
 
 def curve_params(threshold):
@@ -59,7 +64,7 @@ def spot_usd(d):
 
 class Token:
     __slots__ = ("addr", "d", "first_seen", "updated", "hist", "_t", "_peak", "_peak_t",
-                 "ticks", "tick_since", "dev_sold", "dev", "peers")
+                 "ticks", "tick_since", "dev_sold", "dev", "peers", "holders", "launch_buys", "born")
 
     def __init__(self, addr, d, now):
         self.addr = addr
@@ -74,6 +79,11 @@ class Token:
         self.dev_sold = 0.0                    # USD the creator has sold (since we started watching)
         self.dev = (d.get("deployer") or "").lower()[2:18]
         self.peers = None                      # pump.fun: {token: createdAt} of every launch by the same creator
+        self.holders = None                    # pump.fun, coins watched since launch: wallet -> tokens held
+        self.launch_buys = 0.0                 # pump.fun: tokens others bought in the launch's first LAUNCH_SEC
+        self.born = d.get("createdAt") or now  # launch time as first seen (the launch window never moves)
+        if V.PUMP:  # base58 wallets are case-sensitive; trades carry their first WALLET_CHARS characters
+            self.dev = (d.get("deployer") or "")[:WALLET_CHARS]
         created = d.get("createdAt") or now
         launch = launch_price_quote(d)
         if d.get("stage") != "graduated" and launch and now - created < HIST_SEC and d.get("quoteUsd"):
@@ -101,6 +111,10 @@ class Token:
             d["socials"] = {**old["socials"], **(d.get("socials") or {})}  # a partial payload keeps known links
         if d.get("mayhem") is None and old.get("mayhem") is not None:
             d["mayhem"] = old["mayhem"]
+        if d.get("feeBps") is None and old.get("feeBps") is not None:  # learnt from on-chain trades, not the API
+            d["feeBps"] = old["feeBps"]
+        if V.PUMP and d.get("stage") == "graduated" and old.get("stage") != "graduated":
+            self.end_watch()  # PumpSwap trades aren't streamed: per-trade signals stop here
         changed = (d.get("lastTradeAt") != old.get("lastTradeAt") or d.get("raisedQuote") != old.get("raisedQuote")
                    or d.get("priceQuote") != old.get("priceQuote") or d.get("stage") != old.get("stage"))
         self.d = d
@@ -119,10 +133,33 @@ class Token:
                     self._peak, self._peak_t = self.hist[j][1], self.hist[j][0]
         return changed
 
-    def add_tick(self, t, side, usd, wallet, is_dev=False):
+    def start_watch(self, since, now):
+        """pump.fun: the trade stream covers this coin from `since` on. A coin first seen within BORN_SEC of its
+        launch is watched since launch, so its holders are known exactly; other coins' trade windows count from now."""
+        if self.d.get("stage") == "graduated":
+            self.end_watch()
+            return
+        born = self.born >= since - 5 and now - self.born <= BORN_SEC
+        self.tick_since = max(since, self.born) if born else max(since, now)
+        self.holders = {} if born else None
+        self.launch_buys = 0.0
+
+    def end_watch(self):
+        self.tick_since = math.inf
+        self.holders = None
+
+    def add_tick(self, t, side, usd, wallet, is_dev=False, tokens=None):
         self.ticks.append((t, side, usd, wallet))
         if is_dev and side < 0:
             self.dev_sold += usd
+        if tokens is not None and self.holders is not None and wallet:
+            h = self.holders.get(wallet, 0.0) + side * tokens
+            if h > 0.5:
+                self.holders[wallet] = h
+            else:  # sold out (or sold tokens it got some other way)
+                self.holders.pop(wallet, None)
+            if side > 0 and not is_dev and t - self.born <= LAUNCH_SEC:
+                self.launch_buys += tokens
         cut = t - TICK_SEC
         while self.ticks and self.ticks[0][0] < cut:
             self.ticks.popleft()
@@ -141,6 +178,7 @@ class Token:
             return born_watched or now - w >= known
 
         b60 = s60 = whale = vol60 = vol900 = 0.0
+        n60 = 0
         buyers, sellers = set(), set()
         for t, side, usd, wallet in reversed(self.ticks):
             age = now - t
@@ -149,6 +187,7 @@ class Token:
             vol900 += usd
             if age <= 60:
                 vol60 += usd
+                n60 += 1
                 if side > 0:
                     b60 += usd
                     whale = max(whale, usd)
@@ -160,6 +199,8 @@ class Token:
             out["buyRatio1m"] = 100.0 * b60 / (b60 + s60) if b60 + s60 > 0 else None
             out["netFlow1m"] = b60 - s60
             out["whale1m"] = whale
+            if V.PUMP:  # the API reports no volume or trade count: count the streamed trades instead
+                out["tpm1"], out["vol1m"] = float(n60), vol60
         if valid(300):
             out["buyers5m"] = len(buyers)
             out["sellers5m"] = len(sellers)
@@ -244,6 +285,14 @@ class Token:
             out["stdCurve"] = "yes" if abs(res[0] * res[1] / STD_CURVE_K - 1.0) < 0.005 else "no"
         else:
             out["stdCurve"] = None if curve else "yes"  # graduated: priced on the modelled pool
+        if self.holders is not None:  # watched since launch: every wallet's balance is known
+            sup = d.get("supply") or TOKEN_SUPPLY
+            out["holders"] = len(self.holders)
+            out["devHoldPct"] = 100.0 * self.holders.get(self.dev, 0.0) / sup if self.dev else None
+            out["top10Pct"] = 100.0 * sum(heapq.nlargest(10, self.holders.values())) / sup
+            out["launchBuyPct"] = 100.0 * self.launch_buys / sup
+        else:
+            out["holders"] = out["devHoldPct"] = out["top10Pct"] = out["launchBuyPct"] = None
         return out
 
 
@@ -254,6 +303,8 @@ class Market:
         self.tick_start = None  # when the trade feed started (or last restarted after a gap)
         self._pending = deque()  # trades for curves we haven't seen in the launch list yet
         self.creators = {}       # pump.fun: creator wallet -> {token: createdAt}
+        self._orphans = {}       # pump.fun: mint -> streamed trades of a coin not known yet (kept ORPHAN_SEC)
+        self._orphans_pruned = 0.0
 
     def ingest(self, items, now):
         seen = []
@@ -266,6 +317,8 @@ class Market:
                 t = self.tokens[addr] = Token(addr, d, now)
                 if self.tick_start is not None:
                     t.tick_since = max(self.tick_start, d.get("createdAt") or 0)
+                    if V.PUMP:
+                        t.start_watch(self.tick_start, now)
                 if V.PUMP and d.get("deployer"):
                     t.peers = self.creators.setdefault(d["deployer"], {})
                     t.peers[addr] = d.get("createdAt") or now
@@ -281,6 +334,46 @@ class Market:
         self.tick_start = now
         for t in self.tokens.values():
             t.tick_since = max(now, t.d.get("createdAt") or 0)
+            if V.PUMP:
+                t.start_watch(now, now)
+
+    def stop_ticks(self):
+        """The trade feed is down: per-trade signals are unknown until it restarts (start_ticks)."""
+        self.tick_start = None
+        self._orphans = {}
+        for t in self.tokens.values():
+            t.end_watch()
+
+    def add_stream_trades(self, trades, now):
+        """pump.fun: trades from the on-chain stream (pumpstream trade events) -> recording rows
+        [token, t, side, usd, wallet, is_dev, tokens]. Trades of coins the market doesn't know yet wait up to
+        ORPHAN_SEC for the coin to show up."""
+        if self.tick_start is None:
+            self.start_ticks(now)
+        rows = []
+        for a in [a for a in self._orphans if a in self.tokens]:
+            tok = self.tokens[a]
+            rows += [self._stream_trade(tok, e) for e in self._orphans.pop(a)]
+        for e in trades:
+            tok = self.tokens.get(e["mint"])
+            if tok is None:
+                self._orphans.setdefault(e["mint"], []).append(e)
+            else:
+                rows.append(self._stream_trade(tok, e))
+        if now - self._orphans_pruned > 10:
+            cut = now - ORPHAN_SEC
+            self._orphans = {a: [e for e in es if e["t"] >= cut] for a, es in self._orphans.items() if es[-1]["t"] >= cut}
+            self._orphans_pruned = now
+        return rows
+
+    @staticmethod
+    def _stream_trade(tok, e):
+        qu = tok.d.get("quoteUsd")
+        usd = e["sol"] * qu if qu else 0.0
+        is_dev = bool(tok.dev) and e["wallet"] == tok.dev
+        tok.add_tick(e["t"], e["side"], usd, e["wallet"], is_dev, e["tokens"])
+        return [tok.addr, round(e["t"], 2), e["side"], round(usd, 2), e["wallet"], 1 if is_dev else 0,
+                float(f"{e['tokens']:.6g}")]
 
     def add_ticks(self, raw, now):
         """raw: decoded log ticks (curve, t, side, quote_raw, wallet). Returns the resolved trades as
@@ -310,13 +403,13 @@ class Market:
         return rows
 
     def add_tick_rows(self, rows, now):
-        """Replay path: rows already resolved to [token, t, side, usd, wallet, is_dev]."""
+        """Replay path: rows already resolved to [token, t, side, usd, wallet, is_dev] (pump.fun: + tokens)."""
         if self.tick_start is None:
             self.start_ticks(now)
-        for addr, t, side, usd, wallet, is_dev in rows:
-            tok = self.tokens.get(addr)
+        for row in rows:
+            tok = self.tokens.get(row[0])
             if tok is not None:
-                tok.add_tick(t, side, usd, wallet, bool(is_dev))
+                tok.add_tick(row[1], row[2], row[3], row[4], bool(row[5]), row[6] if len(row) > 6 else None)
 
     def get(self, addr):
         return self.tokens.get(addr)

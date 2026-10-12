@@ -114,7 +114,9 @@ class Dataset:
                     continue
                 pending.append((tok, i))
             # trades are applied before features, exactly like the live engine; a recording gap restarts windows
-            if ticks is not None:
+            if tick_gap == "stop":  # pump.fun: the trade stream was down from here on
+                mk.stop_ticks()
+            elif ticks is not None:
                 if mk.tick_start is None or tick_gap or (prev is not None and t - prev > 60):
                     mk.start_ticks(t)
                 mk.add_tick_rows(ticks, t)

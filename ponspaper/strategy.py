@@ -38,6 +38,10 @@ FILTERS = {
     "replies":     ("Replies", "#", "range", "Comments on the coin's pump.fun page"),
     "creatorCoins": ("Creator's coins 24h", "#", "range", "Coins the same wallet launched in the last 24h, this one included (launches seen since start-up)"),
     "depthUsd":    ("Curve depth", "$", "range", "Quote in the bonding curve's virtual reserve (the pool's, once graduated), USD. A normal pump.fun curve starts with 30 SOL; much less means a non-standard curve too thin to trade"),
+    "holders":     ("Holders", "#", "range", "Wallets holding the coin (on-chain trade stream; coins watched since launch only)"),
+    "devHoldPct":  ("Creator holds", "%", "range", "Share of supply the creator's wallet still holds (on-chain trade stream; coins watched since launch only)"),
+    "top10Pct":    ("Top 10 hold", "%", "range", "Share of supply held by the 10 biggest wallets, creator included, curve excluded (on-chain trade stream; coins watched since launch only)"),
+    "launchBuyPct": ("Launch buys", "%", "range", "Share of supply bought by wallets other than the creator in the first 3 seconds after launch: snipers and bundled buys (on-chain trade stream; coins watched since launch only)"),
     "live":        ("Livestream", "", "enum", "The creator is livestreaming on pump.fun right now"),
     "mayhem":      ("Mayhem mode", "", "enum", "Launched in pump.fun's Mayhem mode: an AI agent trades it and the curve is non-standard (often very thin)"),
     "stdCurve":    ("Standard curve", "", "enum", "The bonding curve keeps pump.fun's standard constant (30 SOL x 1,073M tokens). Non-standard curves have their reserves moved by the program without trades, so they can't be priced"),
@@ -183,8 +187,10 @@ SPACE = [
     ("exits.stuckMin",          [2, 3, 5, 10, 20, 45, 90], 0.5),
 ]
 if V.PUMP:
-    SPACE = [(path, pumpfun.SPACE_VALUES.get(path, values), p_on) for path, values, p_on in SPACE
+    SPACE = [(path, pumpfun.SPACE_VALUES.get(path, values), pumpfun.SPACE_P_ON.get(path, p_on)) for path, values, p_on in SPACE
              if path.split(".")[1] not in V.UNAVAILABLE] + pumpfun.SPACE_EXTRA
+    _scale = pumpfun.FILTER_P_ON_TOTAL / sum(p for path, _, p in SPACE if path.startswith("filters."))
+    SPACE = [(path, values, p * _scale if path.startswith("filters.") else p) for path, values, p in SPACE]
 GENE_PATHS = [g[0] for g in SPACE]
 
 
@@ -288,7 +294,9 @@ def describe(spec):
                                     ("volSpike", "spike", "x", 1), ("devSoldUsd", "devsold", "$", 1),
                                     ("inflow1m", "in1m", "$", 1), ("inflow5m", "in5m", "$", 1), ("fillRate", "speed", "%/m", 1),
                                     ("athDdPct", "ath-dd", "%", 1), ("replies", "replies", "", 1), ("creatorCoins", "devcoins", "", 1),
-                                    ("depthUsd", "depth", "$", 1)):
+                                    ("depthUsd", "depth", "$", 1), ("holders", "holders", "", 1),
+                                    ("devHoldPct", "dev", "%", 1), ("top10Pct", "top10", "%", 1),
+                                    ("launchBuyPct", "launch", "%", 1)):
         t = rng_txt(key, unit, scale)
         if t:
             parts.append(f"{label} {t}")
