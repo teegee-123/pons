@@ -156,19 +156,30 @@ that are already set. Behind the Standard Bank proxy gRPC can't connect: the pro
 HTTP/1.1, and gRPC needs HTTP/2 end to end, so the office network falls back to the websocket. At home or on Render,
 gRPC is used.
 
-**Fills read the chain.** When an order lands (`latencyMs` after the signal, give or take half of *Latency jitter*:
-a transaction lands in whichever ~400 ms slot it makes), it is quoted on the coin's curve right then: from the stream
-when it has watched the coin, else read from Solana. Pricing is constant product on the virtual reserves with the fees
-the program charges, which reproduces real on-chain trades to the token. Open positions are marked the same way, so
-take profit / stop loss act on live chain state. The pump.fun API can lag a busy coin by several percent; the chain
-can't.
+**Fills use the slot the order lands in.** An order lands `latencyMs` after the signal (give or take half of
+*Latency jitter*: how long a transaction takes to land varies). It must meet the curve as it stood on chain at that
+moment, but the stream only shows that moment later: it runs about 0.8 s behind the chain on the websocket. So the
+order waits for the stream to catch up (its lag, measured from every trade's block time), takes the newest slot
+the stream has then delivered as its landing slot, waits one more slot (Solana slots are about 0.21 s; the stream
+measures them) so all of that slot's trades are in, and fills on the curve after every trade of earlier slots and a
+random number of the trades in its own slot: where in a slot a transaction lands isn't up to the sender. Hovering a
+fill in the Trades tab shows its slot and position. Coins the stream hasn't seen trade yet are read from Solana.
+
+Without this, fills were priced on what the stream had shown when the order landed, i.e. the chain about 0.8 s
+earlier. Measured on live fills, that was optimistic in fast markets: one 21-minute run's sells would have filled
+1.5% worse on average (p90 5%), a later 6-minute run's on average about the same, but 1 in 10 sells 2.5% worse or
+more. The cost is in the tail, where stop losses meet falling prices.
+
+Pricing is constant product on the virtual reserves with the fees the program charges, which reproduces real
+on-chain trades to the token. Open positions are marked on the stream's latest curve, so take profit / stop loss act
+on what a bot on the same feed would see.
 
 | Cost | How it is modelled on pump.fun |
 |---|---|
 | Curve fee | the coin's own: 0.95% protocol + its creator fee, from its on-chain trades; 1.25% until one has been seen |
 | Graduated (PumpSwap) | 1.25% by default. The real fee is tiered by market cap (about 1.15% at $200k, 0.3% above $20M) |
 | Solana fee | $0.05 per transaction (base + priority fee), reverted ones included |
-| Latency | 750 ms ± 200 ms (*Latency jitter* 400); the lab uses the average |
+| Latency | 750 ms ± 200 ms (*Latency jitter* 400) after the signal, then priced as the chain stood in that slot; the lab uses the average |
 | Slippage limits | as on pons |
 
 Set `SOLANA_RPC_URL` to a private RPC (a free Helius or QuickNode endpoint) for reliability; without it the
@@ -234,10 +245,12 @@ been bred from them. So on pump.fun (settings under Live evolution and Genetic l
 - **Lab: leave out best trades = 1:** genomes are scored, and must pass every exam, without their best trade.
 
 **Genetic lab.** Trains on the last 2 hours, with at most one entry candidate per coin every 6 seconds
-(*Candidate spacing*), which keeps it near 120 MB of memory on a 512 MB server. Recorded snapshots can't show how
-far a price moves between a signal and its fill, but live fills do: with *Charge live slippage* on (the pump.fun
-default), the lab charges every simulated trade the per-side slippage measured on recent live fills, so its
-results line up with live trading.
+(*Candidate spacing*), which keeps it near 120 MB of memory on a 512 MB server. The stream's lag is recorded, so
+simulated fills wait for it exactly like live ones: the lab prices a fill on the recording as it stood `latencyMs` +
+lag after the signal. Recordings made without the stream can't show how far a price moves between a signal and its
+fill, but live fills do: with *Charge live slippage* on (the pump.fun default), the lab then charges every simulated
+trade the per-side slippage measured on recent live fills. On stream recordings that would count the same move
+twice, so it is skipped (the Genetic lab tab shows which: *Fills priced on*).
 
 **Recording.** Only coins in the trading universe (plus anything held) are recorded, in a compact form (curve
 reserves; price, market cap and progress are derived again on replay), and unchanged rows are skipped for 60 s.

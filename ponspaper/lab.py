@@ -18,7 +18,9 @@ Pipeline
      marked down; live winners are fed back into the population.
   7. Slippage calibration (calibrateSlippage): recorded snapshots can't show how far the price moves between a
      signal and its fill, but live fills measure it. The measured per-side slippage is charged on every simulated
-     trade, so the lab's returns match what live trading actually gets.
+     trade, so the lab's returns match what live trading actually gets. Recordings of pump.fun's trade stream do show
+     it (every trade, and the stream's lag behind the chain, which fills wait for like live ones), so on those the
+     lab prices fills itself and charges nothing extra.
   8. Long-run record: the lab only trains on a short recent window, so on its own it forgets. Every tracked genome
      (the best of each window, champions, live winners) is also scored on each new stretch of data that arrived
      after it was added, i.e. data it was never bred on. Only running totals are kept, so the record survives the
@@ -77,13 +79,20 @@ class Dataset:
         mk = Market()
         t_yield = time.time()
         self.tick_rows = 0
-        for t, items, ticks, tick_gap in records:
+        self.lag_t, self.lag_v = [], []  # the trade stream's recorded lag behind the chain, from each time on
+        self.streamed = 0.0         # seconds of recording with the trade stream running
+        for t, items, ticks, tick_gap, lag in records:
             prev = self.t1
             if self.t0 is None:
                 self.t0 = t
             elif t - self.t1 < 120:
                 self.covered += t - self.t1
+                if ticks is not None:
+                    self.streamed += t - self.t1
             self.t1 = t
+            if lag != (self.lag_v[-1] if self.lag_v else 0.0):
+                self.lag_t.append(t)
+                self.lag_v.append(lag)
             pending = []
             for d in items:
                 a = d["address"]
@@ -141,6 +150,16 @@ class Dataset:
     @property
     def hours(self):
         return self.covered / 3600.0
+
+    @property
+    def stream_share(self):
+        """Share of the recording with pump.fun's trade stream running."""
+        return self.streamed / self.covered if self.covered else 0.0
+
+    def lag_at(self, t):
+        """The trade stream's lag behind the chain at time t (0 without a stream)."""
+        i = bisect.bisect_right(self.lag_t, t) - 1
+        return self.lag_v[i] if i >= 0 else 0.0
 
     def split_time(self, validate_frac):
         """Split by number of entry candidates, not clock time, so gaps in the recording (trader asleep or
@@ -219,7 +238,9 @@ class Evaluator:
         t_sig, i, _ = ds.cands[ci]
         times, pts = ds.pt[i], ds.pp[i]
         si = bisect.bisect_right(times, t_sig) - 1
-        fi = bisect.bisect_right(times, t_sig + self.lat) - 1
+        # the order lands `lat` after the signal and meets the chain as it was then, which the recording (made from
+        # the trade stream) only shows the stream's lag later
+        fi = bisect.bisect_right(times, t_sig + self.lat + ds.lag_at(t_sig)) - 1
         if si < 0 or fi < 0:
             self.memo[mk] = None
             return None
@@ -281,7 +302,7 @@ class Evaluator:
                 reason, t_exit = "end of data", t_now
                 break
             k += 1
-        ei = bisect.bisect_right(times, t_exit + self.lat) - 1 if reason != "end of data" else k
+        ei = bisect.bisect_right(times, t_exit + self.lat + ds.lag_at(t_exit)) - 1 if reason != "end of data" else k
         proceeds = _sell_usd(pts[ei], tokens) * (1.0 - self.extra_fee) - self.gas
         r = (t_exit + (self.lat if reason != "end of data" else 0.0), cost, proceeds, reason)
         if len(self.memo) > 120000:  # keep memory bounded on small servers
@@ -480,7 +501,9 @@ class Lab:
         self.ds = ds
         self.gens_on_data = 0
         self.best_seen = -math.inf
-        slip = self.slip if lc.get("calibrateSlippage") else 0.0
+        # live fills' slippage is charged only on recordings that can't show it themselves: the trade stream's
+        # recordings already price fills at the chain state the order met, so charging it again would count it twice
+        slip = self.slip if lc.get("calibrateSlippage") and ds.stream_share < 0.5 else 0.0
         self.ev = Evaluator(ds, ex, self.cfg["sizing"], extra_fee=slip)
         self.ev_stress = Evaluator(ds, ex, self.cfg["sizing"], extra_latency=lc["stressLatencyMs"] / 1000.0,
                                    extra_fee=lc["stressFeeBps"] / 1e4 + slip)
@@ -845,7 +868,8 @@ class Lab:
         return {
             "phase": self.phase, "lastError": self.last_error, "gen": self.gen, "evals": self.evals,
             "genSecs": self.gen_secs, "mutation": self.mutation,
-            "slippage": {"perSide": getattr(self, "slip_used", 0.0), "measured": self.slip, "fills": self.slip_n},
+            "slippage": {"perSide": getattr(self, "slip_used", 0.0), "measured": self.slip, "fills": self.slip_n,
+                         "streamShare": ds.stream_share if ds is not None else None},
             "dataset": None if ds is None else {"hours": ds.hours, "rows": ds.rows, "cands": len(ds.cands),
                                                 "tokens": len(ds.tok_addr), "t0": ds.t0, "t1": ds.t1,
                                                 "split": self.split, "builtAt": ds.built_at, "folds": len(self.folds) + 1},

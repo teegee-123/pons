@@ -76,8 +76,8 @@ def cmd_replay(a):
             eng.upsert_strategy({k: v for k, v in sp.items() if k != "id"})
     t0, n, first, last = time.time(), 0, None, None
     print(f"replaying {len(files)} file(s) with {len(eng.runs)} strategies...")
-    for t, items, ticks, gap in snapshot_items(files):
-        eng.tick(items, t, tick_rows=ticks, tick_gap=gap)
+    for t, items, ticks, gap, lag in snapshot_items(files):
+        eng.tick(items, t, tick_rows=ticks, tick_gap=gap, feed_lag=lag)
         first = first or t
         last = t
         n += 1

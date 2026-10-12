@@ -32,7 +32,7 @@ CONFIG = {
     "rpcUrl": None,                # Solana RPC comes from SOLANA_RPC_URL (see solana.py), never from the config
     "poll": {"intervalSec": 2.0, "refreshCap": 8, "heldRefreshSec": 5.0, "lists": DEFAULT_LISTS},
     "execution": {
-        "latencyJitterMs": 400,    # a transaction lands in whichever ~400 ms slot it makes: +-200 ms around latencyMs
+        "latencyJitterMs": 400,    # landing time varies (which slot it makes, ~0.21 s each): +-200 ms around latencyMs
         "gasUsd": 0.05,            # Solana base fee + priority fee / tip, per transaction
         "protocolFeeBps": 125,     # bonding curve: 0.95% protocol + 0.30% creator, until a coin's own on-chain
                                    # trades show its fee (some coins' creators charge 1%: 195 bps)

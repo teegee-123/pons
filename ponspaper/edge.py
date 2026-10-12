@@ -6,7 +6,8 @@ feature bucket shows which conditions have had positive expectancy after costs.
 
 With `fillLatency` (pump.fun) the buy lands `latencyMs` after the signal, like a real order, and is priced at the
 first quote after that: coins whose curve completes in the launch transaction can jump x10,000 within one poll, and
-a buy at the price that triggered the sample would have been impossible.
+a buy at the price that triggered the sample would have been impossible. With the trade stream, that quote is the
+one that shows the chain at landing: feed_lag later.
 """
 import json
 import os
@@ -49,8 +50,9 @@ BUCKETS = {
 BUCKETS = {k: v for k, v in BUCKETS.items() if k not in V.UNAVAILABLE}
 GRID = ("ageMin", "mcapUsd")
 # Bumped when the way samples are valued changes, so a saved edge map built the old way starts again instead of
-# mixing. pump.fun 2: sells priced with our own buy in the curve, bounded on non-standard curves.
-PRICING = 2 if V.PUMP else 1
+# mixing. pump.fun 2: sells priced with our own buy in the curve, bounded on non-standard curves; 3: buys priced on
+# the chain as it stood at landing (the trade stream's lag added).
+PRICING = 3 if V.PUMP else 1
 
 
 def bucket(key, v):
@@ -103,7 +105,7 @@ class EdgeMap:
         self.base = [_agg_new() for _ in range(H)]
         self.samples = 0
 
-    def maybe_sample(self, tok, feats, now, ex):
+    def maybe_sample(self, tok, feats, now, ex, feed_lag=0.0):
         if not self.cfg.get("enabled", True):
             return
         if now - self.last_sample.get(tok.addr, 0) < self.cfg["sampleEverySec"]:
@@ -119,7 +121,7 @@ class EdgeMap:
              "raw": raw, "rets": [None] * len(self.cfg["horizonsMin"])}
         if self.cfg.get("fillLatency"):  # priced when the order lands (resolve)
             s["tokens"] = s["cost"] = None
-            s["fillAt"] = now + ex["latencyMs"] / 1000.0
+            s["fillAt"] = now + ex["latencyMs"] / 1000.0 + feed_lag
         self.pending.append(s)
 
     def _buy(self, d, ex):

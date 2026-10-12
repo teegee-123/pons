@@ -36,7 +36,7 @@ DEFAULT_CONFIG = {
     "poll": {"intervalSec": 2.0, "pages": 1, "sort": "active", "refreshCap": 6, "heldRefreshSec": 60.0},
     "execution": {
         "latencyMs": 750,          # signal -> transaction landing
-        "latencyJitterMs": 0,      # each order lands up to half this earlier or later than latencyMs (pump.fun: a slot)
+        "latencyJitterMs": 0,      # each order lands up to half this earlier or later than latencyMs (off on pons)
         "gasUsd": 0.02,            # per transaction (reverted ones too)
         "buySlippagePct": 10.0,    # minOut tolerance vs the quote at signal time; worse fills revert
         "sellSlippagePct": 40.0,
@@ -187,6 +187,8 @@ class Engine:
         self.client = Client() if live else None
         self.stream = None   # pump.fun: on-chain trade stream (gRPC or websocket), see pumpstream.py
         self._stream_up = False
+        self._replay_lag = 0.0     # replays: the stream's lag behind the chain, as recorded
+        self._rec_lag = (None, 0.0)  # last recorded lag and when
         if live and V.PUMP:  # Solana reads for fills and open positions; trades come from the stream
             self.chain, self.tickfeed = SolanaChain(self.client, solana_rpc_url()), None
             self.stream = pumpstream.open_stream(self.cfg["stream"], self.client._proxy)
@@ -463,6 +465,7 @@ class Engine:
                     if self._stream_up and not healthy:  # trades are being missed: per-trade signals are unknown
                         with self.lock:
                             self.market.stop_ticks()
+                            self._rec_lag = (0.0, t0)  # fills read the chain directly while the stream is down
                             if self.live and self.cfg["record"]["enabled"]:
                                 self._rec_buf.append(json.dumps({"t": round(t0, 2), "xs": 1}, separators=(",", ":")))
                         self.status["streamOutages"] += 1
@@ -641,9 +644,12 @@ class Engine:
         return out
 
     # ------------------------------------------------------------------ core tick (live + replay)
-    def tick(self, items, now, listed=None, live_ticks=None, tick_rows=None, tick_gap=False):
-        """live_ticks: (decoded trades, gap, ok) from the chain feed; tick_rows: recorded trades (replay)."""
+    def tick(self, items, now, listed=None, live_ticks=None, tick_rows=None, tick_gap=False, feed_lag=None):
+        """live_ticks: (decoded trades, gap, ok) from the chain feed; tick_rows: recorded trades (replay);
+        feed_lag: the recorded lag of the trade stream behind the chain (replay)."""
         with self.lock:
+            if feed_lag is not None:
+                self._replay_lag = feed_lag
             toks = self.market.ingest(items, now)
             rec_ticks = None
             if live_ticks is not None:
@@ -701,7 +707,7 @@ class Engine:
             f = feats.get(tok.addr)
             if f is None or not S.passes(uni, f):
                 continue
-            self.edge.maybe_sample(tok, f, now, ex)
+            self.edge.maybe_sample(tok, f, now, ex, self.feed_lag())
             for run in runs:
                 sp, pf = run.spec, run.pf
                 sz = sp["sizing"]
@@ -732,11 +738,20 @@ class Engine:
         run.last_entry[tok.addr] = now
         self.executor.submit({
             "id": oid, "sid": run.spec["id"], "side": "buy", "addr": tok.addr, "sym": d.get("symbol"),
-            "t_signal": now, "due": now + self._latency(ex), "size_usd": size, "tokens": None, "pos_id": None,
+            "t_signal": now, "due": now + self._latency(ex) + self._replay_lag, "size_usd": size, "tokens": None, "pos_id": None,
             "reason": "entry", "sig_spot_usd": spot_usd(d), "expected_out": exp_tokens,
             "tol": ex["buySlippagePct"] / 100.0, "stage": d.get("stage"),
             "feats": {k: (round(f[k], 4) if isinstance(f.get(k), float) else f.get(k)) for k in FEAT_KEEP},
         })
+
+    def feed_lag(self):
+        """Seconds the market data runs behind the chain: the trade stream's measured lag live (0 while it isn't
+        healthy: then fills read the chain directly), the recorded one in replays. An order landing at time t meets
+        the chain as it was at t, which the data only shows feed_lag later."""
+        if not self.live:
+            return self._replay_lag
+        s = self.stream
+        return (s.feed_lag or 0.0) if s is not None and s.healthy() else 0.0
 
     def _latency(self, ex):
         """Signal -> landing, in seconds: latencyMs, give or take half of latencyJitterMs (a transaction lands in
@@ -754,7 +769,7 @@ class Engine:
         pos.exiting = True
         self.executor.submit({
             "id": S.new_id("o"), "sid": run.spec["id"], "side": "sell", "addr": pos.addr, "sym": pos.symbol,
-            "t_signal": now, "due": now + self._latency(ex), "size_usd": None, "tokens": pos.tokens,
+            "t_signal": now, "due": now + self._latency(ex) + self._replay_lag, "size_usd": None, "tokens": pos.tokens,
             "pos_id": pos.id, "reason": reason, "sig_spot_usd": spot_usd(d) if d else None, "expected_out": exp_q,
             "tol": 1.0 if force else ex["sellSlippagePct"] / 100.0, "stage": d.get("stage"),
         })
@@ -808,7 +823,8 @@ class Engine:
                 lat = round((r["t_fill"] - o["t_signal"]) * 1000)
                 ev = {"t": r["t_fill"], "sid": o["sid"], "name": run.spec["name"] if run else "(deleted)", "side": o["side"],
                       "sym": o.get("sym"), "addr": o["addr"], "ok": r["ok"], "src": r["src"], "latMs": lat,
-                      "reason": o["reason"], "err": r.get("err"), "usd": None, "drift": None, "pnl": None}
+                      "reason": o["reason"], "err": r.get("err"), "usd": None, "drift": None, "pnl": None,
+                      "slot": r.get("slot")}
                 if run is None:
                     self.fills.appendleft(ev)
                     continue
@@ -1028,8 +1044,17 @@ class Engine:
             rows.append(row)
         if dedupe and len(self._rec_last) > 5000:
             self._rec_last = {a: v for a, v in self._rec_last.items() if now - v[1] < dedupe}
-        if rows or tick_rows is not None or tick_gap:
+        lag = None
+        if V.PUMP and self.stream is not None:  # replays and the lab fill orders this much later, like live
+            lag = round(self.feed_lag(), 2)
+            if self._rec_lag[0] is not None and abs(lag - self._rec_lag[0]) < 0.05 and now - self._rec_lag[1] < 60:
+                lag = None
+            else:
+                self._rec_lag = (lag, now)
+        if rows or tick_rows is not None or tick_gap or lag is not None:
             rec = {"t": round(now, 2), "v" if V.PUMP else "u": rows}
+            if lag is not None:
+                rec["lag"] = lag
             if tick_rows is not None:
                 rec["x"] = tick_rows   # trades since the previous poll (present, possibly empty, while the feed works)
             if tick_gap:
@@ -1292,7 +1317,7 @@ def _json_default(o):
 
 
 def snapshot_items(paths):
-    """Yield (t, items) from recorded snapshot files (used by replay)."""
+    """Yield (t, items, ticks, tick_gap, feed_lag) from recorded snapshot files (used by replay)."""
     def lines():
         for path in paths:
             with gzip.open(path, "rt", encoding="utf8") as fh:
@@ -1301,11 +1326,13 @@ def snapshot_items(paths):
 
 
 def snapshot_records(lines):
-    """Yield (t, items, ticks, tick_gap) from recorded snapshot lines. ticks is None when the trade feed wasn't
-    running for that poll; tick_gap is True where it restarted and "stop" where it went down. Token metadata carries across files, so rows near an hour boundary aren't dropped.
+    """Yield (t, items, ticks, tick_gap, feed_lag) from recorded snapshot lines. ticks is None when the trade feed
+    wasn't running for that poll; tick_gap is True where it restarted and "stop" where it went down; feed_lag is how
+    far the pump.fun trade stream ran behind the chain (0 without it), which fills are delayed by. Token metadata carries across files, so rows near an hour boundary aren't dropped.
     Rows are pons rows ("u") or compact pump.fun rows ("v")."""
     meta = {}
     last_t = None
+    lag = 0.0
     for line in lines:
         line = line.strip()
         if not line:
@@ -1337,5 +1364,9 @@ def snapshot_records(lines):
             m = meta.get(row[0])
             if m is not None:
                 items.append(pumpfun.expand_row(row, m))
+        if rec.get("xs"):
+            lag = 0.0
+        elif rec.get("lag") is not None:
+            lag = rec["lag"]
         # tick gap: True = the trade feed restarts here, "stop" = it was down from here on (pump.fun stream)
-        yield rec["t"], items, rec.get("x"), "stop" if rec.get("xs") else bool(rec.get("xg"))
+        yield rec["t"], items, rec.get("x"), "stop" if rec.get("xs") else bool(rec.get("xg")), lag

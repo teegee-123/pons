@@ -36,8 +36,16 @@ state, 250 ms reactions, per-coin fees. Still open:
   "reconnecting", add a free Helius key as `SOLANA_RPC_URL` (its websocket is used automatically).
 - **Stream PumpSwap too.** Graduated coins still fill on the API with a modelled pool, and their per-trade signals
   stop at graduation. PumpSwap logs `BuyEvent`/`SellEvent` with pool reserves (pump_amm IDL).
-- **Priority fees in SOL.** `gasUsd` is a flat $0.05. Real bots pay a priority fee and often a Jito tip in SOL, more
-  when competing for the same slot.
+- **Real transaction costs and failures, measured from the chain** (needs gRPC: full transactions). `gasUsd` is a flat
+  $0.05 and only slippage reverts. Read the priority fees and Jito tips paid by trades in the same coin and moment,
+  and how often pump.fun buys fail on slippage (failed transactions still pay fees), and charge orders the same.
+- **Dropped transactions.** Sometimes an order never lands, and a stop loss goes out again a slot or two later.
+- **Token account rent.** A first buy of a coin locks about 0.002 SOL, refunded when the position is closed out.
+- **Calibrate with real trades.** A small live mode: real $2–5 orders from your own wallet, logged next to the paper
+  fill for the same signal, to measure our own landing time, failure rate and fees (you run it, not the assistant).
+
+Done: orders fill on the slot they land in (the stream's lag is measured from block times and recorded, so the lab
+and replays fill the same way). Solana slots are ~0.21 s now (Oct 2026), measured by the stream, not assumed.
 
 ## Smaller follow-ups found along the way
 

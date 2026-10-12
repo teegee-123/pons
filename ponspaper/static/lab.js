@@ -43,6 +43,13 @@ function liveCell(l, deployed) {
   return `<span class="${l.status === "winning" ? "pos" : "neg"}" data-tip="${l.n} closed trades · P&L ${fSUsd(l.pnl)}${l.why ? "<br>" + esc(l.why) : ""}">${label} ${fP(l.score, 1)}</span>`;
 }
 
+// how simulated fills are priced: on the trade stream's recording (lag modelled), or recorded quotes plus live slippage
+function fillStat(sl, stat) {
+  if (sl.streamShare != null && sl.streamShare >= 0.5)
+    return stat("Fills priced on", `<span data-tip="${fNum(sl.streamShare * 100, 0)}% of the data comes with the chain trade stream: fills wait for its recorded lag behind the chain, like live ones, so live slippage isn't charged on top">chain trades</span>`);
+  return stat("Fills priced on", sl.perSide ? `quotes + ${fNum(sl.perSide * 100, 2)}%/side live slippage` : "recorded quotes");
+}
+
 async function renderLab() {
   const v = await api("/api/lab");
   const ds = v.dataset, stat = (l, x, c = "") => `<div class="stat"><span>${l}</span><b class="${c}">${x}</b></div>`;
@@ -52,7 +59,7 @@ async function renderLab() {
     stat("Seconds / generation", v.genSecs == null ? "–" : fNum(v.genSecs, 1)) + stat("Mutation rate", v.mutation == null ? "–" : fNum(v.mutation * 100, 0) + "%") +
     stat("Data recorded", ds ? fNum(ds.hours, 1) + "h" : "–") + stat("Entry candidates", ds ? fNum(ds.cands, 0) : "–") +
     stat("Training slices", ds ? ds.folds : "–") + stat("Validation starts", ds ? new Date(ds.split * 1000).toLocaleString() : "–") +
-    stat("Data loaded", ds ? fTime(ds.builtAt) : "–") +
+    stat("Data loaded", ds ? fTime(ds.builtAt) : "–") + fillStat(v.slippage || {}, stat) +
     stat("Live results fed back", `<span class="pos">${fb.winning || 0} win</span> · <span class="neg">${(fb.losing || 0) + (fb.failed || 0)} lose</span>`);
   const dropped = (v.dropped || []).length ? `<br>Dropped on the last data refresh: ${v.dropped.map(d => esc(d.why)).join(", ")}` : "";
   $("#labErr").innerHTML = esc(v.lastError || "") + `<span class="dim">${dropped}</span>`;

@@ -23,6 +23,7 @@ Coins paired with other quote tokens report zero SOL reserves and are skipped (t
 import base64
 import json
 import os
+import statistics
 import queue
 import socket
 import ssl
@@ -30,12 +31,15 @@ import struct
 import threading
 import time
 import urllib.parse
+from collections import deque
 
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 PUBLIC_WS = "wss://api.mainnet-beta.solana.com"
 GRPC_METHOD = "/geyser.Geyser/Subscribe"
 WALLET_CHARS = 10      # wallets are kept as their first 10 base58 characters: plenty to tell one coin's traders apart
 MAX_LAG_SEC = 5.0      # a stream this far behind the chain is not live any more: unhealthy, and it reconnects
+SLOT_SEC = 0.25        # Solana slot time until the stream has measured it (about 0.21 s in October 2026)
+HIST_SEC = 20.0        # per-coin trade history kept for pricing orders at the slot they land in
 TOKEN_DECIMALS, SOL_DECIMALS = 6, 9
 
 TRADE, CREATE, COMPLETE = "trade", "create", "complete"
@@ -514,8 +518,13 @@ class FallbackSource:
 # ---------------------------------------------------------------------------------------------------- stream
 class TradeStream:
     """Runs a source on its own thread (reconnecting forever) and keeps, for the engine:
-    - curves: mint -> the curve after its latest trade (Q, T, sellable, raised, feeBps, t, epoch). While the stream
-      has stayed connected since that trade, this *is* the curve's current state: nothing changed it, or we'd know.
+    - curves: mint -> the curve after its latest trade (Q, T, sellable, raised, feeBps, t, slot, epoch). While the
+      stream has stayed connected since that trade, this *is* the curve's current state: nothing changed it, or we'd
+      know.
+    - hist: mint -> the curve after each of its trades in the last HIST_SEC, with their slots, so an order can be
+      priced on the curve as it stood in the slot it landed in (landing_state).
+    - feed_lag: how far the stream runs behind the chain. An order landing at time t meets the chain as it was at t,
+      which the stream only shows feed_lag later.
     - the events since the engine last drained them, stamped with the time they reached us."""
 
     def __init__(self, source):
@@ -531,8 +540,17 @@ class TradeStream:
         self.last_event_at = None
         self.events = self.trades_seen = self.reconnects = self.errors = self.bytes_in = 0
         self.last_error = None
-        self.lag = None           # EMA of arrival time minus the event's block time (1 s resolution)
+        self.lag = None           # EMA of arrival time minus the event's block time (1 s resolution): health checks
         self.lag_drops = 0        # reconnects because the stream fell more than MAX_LAG_SEC behind
+        self._lags = deque(maxlen=3000)
+        self._lag_at = 0.0
+        self.feed_lag = None      # seconds behind the chain: median(arrival - block time) - 0.5 s (block times are
+        #                           whole seconds, rounded down), over the last few thousand trades
+        self.max_slot = 0         # newest slot the stream has delivered
+        self._slot_marks = deque(maxlen=120)  # (time, newest slot) about once a second, to measure the slot time
+        self.slot_sec = None      # measured seconds per slot
+        self.hist = {}
+        self._hist_pruned = 0.0
         self._rate = (time.time(), 0)
         self.rate = None          # trades per second over the last minute or so
         self.thread = None
@@ -553,6 +571,8 @@ class TradeStream:
                 self.epoch += 1
                 self._gap = True
                 self.lag = None
+                self.hist = {}
+                self._slot_marks.clear()
             try:
                 self.source.run(self)
             except Exception as e:
@@ -579,22 +599,44 @@ class TradeStream:
                 e["t"], e["slot"] = now, slot
                 self.events += 1
                 kind = e["kind"]
+                if slot > self.max_slot:
+                    self.max_slot = slot
                 if kind == TRADE:
                     self.trades_seen += 1
                     self.curves[e["mint"]] = {"Q": e["Q"], "T": e["T"], "sellable": e["sellable"], "raised": e["raised"],
-                                              "feeBps": e["feeBps"], "t": now, "epoch": self.epoch}
+                                              "feeBps": e["feeBps"], "t": now, "slot": slot, "epoch": self.epoch}
                     self._trades.append(e)
+                    self.hist.setdefault(e["mint"], deque()).append((now, slot, e["Q"], e["T"], e["sellable"], e["feeBps"]))
                     lag = now - e["ts"]
                     if -5 < lag < 600:
                         self.lag = lag if self.lag is None else 0.98 * self.lag + 0.02 * lag
+                        self._lags.append(lag)
                 elif kind == CREATE:
                     self.curves[e["mint"]] = {"Q": e["Q"], "T": e["T"], "sellable": e["sellable"], "raised": 0.0,
-                                              "feeBps": None, "t": now, "epoch": self.epoch}
+                                              "feeBps": None, "t": now, "slot": slot, "epoch": self.epoch}
+                    self.hist.setdefault(e["mint"], deque()).append((now, slot, e["Q"], e["T"], e["sellable"], None))
                     self._creates.append(e)
                 else:
-                    self.curves[e["mint"]] = {"complete": True, "t": now, "epoch": self.epoch}
+                    self.curves[e["mint"]] = {"complete": True, "t": now, "slot": slot, "epoch": self.epoch}
+                    self.hist.pop(e["mint"], None)
                     self._completes.append(e)
             self.last_event_at = now
+            if now - self._lag_at >= 2.0 and len(self._lags) >= 50:
+                self._lag_at = now
+                self.feed_lag = max(0.0, statistics.median(self._lags) - 0.5)
+            if not self._slot_marks or now - self._slot_marks[-1][0] >= 1.0:
+                self._slot_marks.append((now, self.max_slot))
+                (t0, s0), (t1, s1) = self._slot_marks[0], self._slot_marks[-1]
+                if t1 - t0 >= 20 and s1 > s0:
+                    self.slot_sec = min(1.0, max(0.05, (t1 - t0) / (s1 - s0)))
+            if now - self._hist_pruned >= 5.0:  # keep HIST_SEC per coin, plus the trade before (the curve then)
+                self._hist_pruned = now
+                cut = now - HIST_SEC
+                for m in [m for m, h in self.hist.items() if h[-1][0] < cut]:
+                    del self.hist[m]
+                for h in self.hist.values():
+                    while len(h) > 1 and h[1][0] < cut:
+                        h.popleft()
             t0, n0 = self._rate
             if now - t0 >= 60:
                 self.rate = (self.trades_seen - n0) / (now - t0)
@@ -620,6 +662,31 @@ class TradeStream:
             return None
         return st
 
+    def landing_state(self, mint, land_slot, rng):
+        """The coin's curve as an order landing in `land_slot` met it: after every trade in earlier slots, and after
+        a random number of the trades in its own slot (where in the slot a transaction lands isn't up to the
+        sender). -> {"Q", "T", "sellable", "feeBps", "before", "inSlot"} or None if unknown."""
+        with self.lock:
+            cur = self.curves.get(mint)
+            h = list(self.hist.get(mint) or ())
+            epoch = self.epoch
+        if cur is None or cur.get("complete") or cur["epoch"] != epoch:
+            return None
+        prev, same = None, []
+        for e in h:
+            if e[1] < land_slot:
+                prev = e
+            elif e[1] == land_slot:
+                same.append(e)
+        k = rng.randint(0, len(same)) if same else 0
+        e = same[k - 1] if k else prev
+        if e is None:
+            if cur["slot"] >= land_slot:  # it traded at or after our slot and its history doesn't reach back
+                return None
+            e = (cur["t"], cur["slot"], cur["Q"], cur["T"], cur["sellable"], cur.get("feeBps"))  # unchanged since
+        return {"Q": e[2], "T": e[3], "sellable": e[4], "feeBps": e[5] if e[5] is not None else cur.get("feeBps"),
+                "before": k, "inSlot": len(same)}
+
     def drain(self):
         """-> (trades, creates, completes, gap) since the previous call. gap: coverage restarted in between."""
         with self.lock:
@@ -639,7 +706,9 @@ class TradeStream:
                 "connectedFor": (now - self.connected_at) if self.connected and self.connected_at else None,
                 "lastEventAgo": (now - self.last_event_at) if self.last_event_at else None,
                 "events": self.events, "trades": self.trades_seen, "tradesPerSec": self.rate,
-                "lagSec": self.lag, "reconnects": self.reconnects, "lagDrops": self.lag_drops, "errors": self.errors,
+                "lagSec": self.feed_lag if self.feed_lag is not None else self.lag, "slot": self.max_slot,
+                "slotMs": self.slot_sec * 1000 if self.slot_sec else None,
+                "reconnects": self.reconnects, "lagDrops": self.lag_drops, "errors": self.errors,
                 "lastError": self.last_error, "mbIn": self.bytes_in / 1e6, "curves": len(self.curves),
                 "note": getattr(self.source, "note", None)}
 

@@ -100,7 +100,7 @@ async function renderTrades() {
       <td class="dim">${esc(t.reason)}</td><td class="dim">${esc(t.src)}</td></tr>`).join("") || `<tr><td colspan="13" class="empty">No closed trades yet.</td></tr>`);
   $("#fillsTbl").innerHTML = `<tr><th>Time</th><th>Strategy</th><th>Side</th><th>Token</th><th>Result</th><th class="n">Latency</th><th class="n">USD</th><th class="n">Drift</th><th class="n">P&L</th><th>Reason</th></tr>` +
     (v.fills.map(f => `<tr><td>${fTime(f.t)}</td><td>${esc(f.name)}</td><td>${f.side}</td><td><b>${esc(f.sym)}</b></td>
-      <td>${f.ok ? `filled <span class="dim">(${esc(f.src)})</span>` : `<span class="neg">reverted</span> <span class="dim">${esc(f.err || "")}</span>`}</td>
+      <td${f.slot ? ` data-tip="landed in slot ${f.slot[0]}, ${f.slot[2] ? `after ${f.slot[1]} of the ${f.slot[2]} other trades of this coin in that slot` : "the only trade of this coin in that slot"}"` : ""}>${f.ok ? `filled <span class="dim">(${esc(f.src)})</span>` : `<span class="neg">reverted</span> <span class="dim">${esc(f.err || "")}</span>`}</td>
       <td class="n">${f.latMs}ms</td><td class="n">${fUsd(f.usd)}</td><td class="n" data-tip="Spot at fill vs spot the strategy saw when it decided">${fPct(f.drift, 2)}</td>
       <td class="n ${cls(f.pnl)}">${f.pnl == null ? "" : fSUsd(f.pnl)}</td><td class="dim">${esc(f.reason)}</td></tr>`).join("") || `<tr><td colspan="10" class="empty">No fills yet.</td></tr>`);
 }
@@ -177,7 +177,7 @@ const chk = (id, l, h, v) => `<label data-tip="${esc(h)}">${esc(l)}</label><inpu
 // pump.fun wording for the fields whose meaning depends on the venue
 const PUMP_META = {
   "execution.latencyMs": ["Latency", "ms", "Delay from the strategy seeing data (a trade arriving on the chain stream, or a poll) to its transaction landing. Fills use the bonding curve at that moment."],
-  "execution.latencyJitterMs": ["Latency jitter", "ms", "A transaction lands in whichever ~400 ms slot it makes: each order lands up to half this earlier or later than the latency. The lab uses the average"],
+  "execution.latencyJitterMs": ["Latency jitter", "ms", "How long a transaction takes to land varies (which slot it makes; Solana slots are about 0.21 s): each order lands up to half this earlier or later than the latency. The lab uses the average"],
   "execution.gasUsd": ["Fee per tx", "$", "Solana base + priority fee (or tip), charged on every transaction including reverted ones"],
   "execution.protocolFeeBps": ["Curve fee", "bps", "Bonding-curve fee on buys and sells: 0.95% protocol + 0.30% creator = 125. Used until the chain stream has seen one of the coin's own trades, whose fee then applies (some coins charge more or less)"],
   "execution.hookFeeBps": ["Graduated pool fee", "bps", "PumpSwap fee after graduation (dynamic; about 1.25% at low market caps)"],

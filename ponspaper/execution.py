@@ -2,16 +2,22 @@
 
 LiveExecutor: each order waits `latencyMs` after the signal, then is quoted against live on-chain state (curve
 reserves or the v4 quoter) and checked against the slippage limit, like a real transaction with minOut. On
-pump.fun the live state is the coin's bonding curve after its latest trade on the chain stream (pumpstream.py), else
-the curve read from Solana, else a fresh pump.fun API read.
+pump.fun the live state is the coin's bonding curve as it stood in the slot the order landed in, from the chain stream
+(pumpstream.py): the stream runs a little behind the chain, so the order waits until the stream has caught up with
+its landing moment and one more slot, then fills after the trades of earlier slots and a random number of the
+trades in its own slot. Without the stream: the curve read from Solana, else a fresh pump.fun API read.
 ReplayExecutor: for backtests on recorded data; fills at the first recorded snapshot at/after the due time.
 """
 import heapq
+import random
 import threading
 import time
 
 from . import venue as V
+from .pumpstream import SLOT_SEC
 from .sim import Venue, model_venue
+
+WAIT = object()  # result of an order that isn't filled yet: back in the queue until order["wake"]
 
 
 def _result(ok, t, src, out=0.0, used=0.0, spot=None, qu=None, fee_frac=0.0, err=None):
@@ -55,6 +61,7 @@ class LiveExecutor:
         self.thread = threading.Thread(target=self._run, name="executor", daemon=True)
         self.last_error = None
         self.rpc_rtt = 0.6  # EMA of the quote round trip; calls start rtt/2 early so state is read at the due time
+        self.rng = random.Random()  # where in its landing slot an order lands
         self.thread.start()
 
     def submit(self, order):
@@ -90,7 +97,15 @@ class LiveExecutor:
             except Exception as e:  # never lose orders: fail them so cash is released
                 self.last_error = repr(e)
                 results = [_result(False, time.time(), "error", err=repr(e)) for _ in batch]
-            self.engine.apply_fills(batch, results)
+            later = [o for o, r in zip(batch, results) if r is WAIT]
+            if later:
+                with self.cv:
+                    for o in later:
+                        self.seq += 1
+                        heapq.heappush(self.heap, (o["wake"], self.seq, o))
+            done = [(o, r) for o, r in zip(batch, results) if r is not WAIT]
+            if done:
+                self.engine.apply_fills([o for o, _ in done], [r for _, r in done])
 
     def _fill(self, orders):
         eng = self.engine
@@ -115,8 +130,8 @@ class LiveExecutor:
         return results
 
     def _solana_fill(self, orders, toks, results, ex):
-        """pump.fun: quote against the coin's bonding curve as it stands right now: after its latest trade on the
-        chain stream when the stream has watched it since, else read from Solana."""
+        """pump.fun: quote against the coin's bonding curve as it stood when the order landed: from the chain stream
+        when it has watched the coin, else read from Solana right now."""
         ds = {o["addr"]: toks[i].d for i, o in enumerate(orders) if toks[i] is not None}
         stream = self.engine.stream
         now = time.time()
@@ -129,10 +144,8 @@ class LiveExecutor:
             if st is not None and st.get("complete"):  # moved to PumpSwap: filled from a fresh API read
                 continue
             if st is not None and d.get("stage") != "graduated":
-                v = Venue("curve", st["Q"], st["T"], st["sellable"], _fee(st, d, ex), d.get("creatorTaxBps") or 0,
-                          src="stream")
-                results[i] = fill_with_venue(o, v, d.get("quoteUsd"), ex, now)
-            else:
+                results[i] = self._stream_fill(o, d, ex, now)
+            if results[i] is None:
                 rest[d["address"]] = d
         if not rest:
             return
@@ -147,6 +160,30 @@ class LiveExecutor:
             v = Venue("curve", st["Q"], st["T"], st["sellable"], _fee(None, d, ex), d.get("creatorTaxBps") or 0,
                       src="chain")
             results[i] = fill_with_venue(o, v, d.get("quoteUsd"), ex, t)
+
+    def _stream_fill(self, o, d, ex, now):
+        """Price an order on the curve in the slot it landed in -> result, WAIT, or None (no stream state: read the
+        chain instead). Landing time is o["due"]; the stream shows that moment feed_lag later. At that point the
+        newest slot it has delivered is the landing slot; one slot later, all of that slot's trades are in."""
+        stream = self.engine.stream
+        if "land_slot" not in o:
+            land_seen = o["due"] + (stream.feed_lag or 0.0)
+            if now < land_seen - 0.02:
+                o["wake"] = land_seen
+                return WAIT
+            o["land_slot"], o["settle_by"] = stream.max_slot, now + 1.5
+            o["wake"] = now + (stream.slot_sec or SLOT_SEC)
+            return WAIT
+        if stream.max_slot <= o["land_slot"] and now < o["settle_by"]:
+            o["wake"] = now + 0.1
+            return WAIT
+        st = stream.landing_state(o["addr"], o["land_slot"], self.rng)
+        if st is None:
+            return None
+        v = Venue("curve", st["Q"], st["T"], st["sellable"], _fee(st, d, ex), d.get("creatorTaxBps") or 0, src="stream")
+        r = fill_with_venue(o, v, d.get("quoteUsd"), ex, o["due"])
+        r["slot"] = (o["land_slot"], st["before"], st["inSlot"])
+        return r
 
     def _api_fill(self, orders, results, ex):
         """pump.fun: re-read the coins still unfilled from the API and fill on that curve / pool state."""

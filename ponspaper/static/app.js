@@ -115,7 +115,8 @@ function renderStream(st) {
     `Every pump.fun curve trade, launch and graduation from Solana${s.host ? " via " + esc(s.host) : ""}. ` +
     `Strategies decide, positions are marked and orders fill on it, every ${S.state.cfg.stream.reactMs} ms.` +
     `<br>events ${fNum(s.events, 0)} · trades ${fNum(s.trades, 0)} · coins tracked ${fNum(s.curves, 0)} · ${fNum(s.mbIn, 0)} MB received` +
-    `<br>behind the chain: ${s.lagSec == null ? "–" : fNum(s.lagSec, 2) + " s"} (block times have 1 s resolution, so about half a second of this is rounding)` +
+    `<br>behind the chain: ${s.lagSec == null ? "–" : fNum(s.lagSec, 2) + " s"} (orders wait this long, then fill on the slot they landed in)` +
+    (s.slotMs ? ` · slots ${fNum(s.slotMs, 0)} ms` : "") +
     `<br>reconnects ${s.reconnects}, outages ${st.streamOutages}, reaction pass ${st.streamTickMs ?? "–"} ms` +
     (s.lastError ? "<br>last error: " + esc(s.lastError) : "") + (st.streamError ? "<br>" + esc(st.streamError) : "");
 }
