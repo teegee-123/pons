@@ -47,6 +47,9 @@ CONFIG = {
         # rent of the token account a buy creates (a 170-byte Token-2022 account: 0.00151384 SOL in real pump.fun buys,
         # Oct 2026), returned when the account is closed on the sell
         "accountRentSol": 0.00151384,
+        # snipers: in a coin's first 15 s, bots paying bigger tips than ours get in first, so an order lands behind
+        # every other trade in its slot instead of at a random place in it
+        "launchCompetitionSec": 15,
     },
     # Coins the simulator can't price are left out:
     # - curve depth: normal curves start at 30 SOL (~$3k); non-standard ones can hold well under 1 SOL, where a $50

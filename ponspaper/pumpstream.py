@@ -807,10 +807,11 @@ class TradeStream:
             return None
         return st
 
-    def landing_state(self, mint, land_slot, rng):
+    def landing_state(self, mint, land_slot, rng, last=False):
         """The coin's curve as an order landing in `land_slot` met it: after every trade in earlier slots, and after
         a random number of the trades in its own slot (where in the slot a transaction lands isn't up to the
-        sender). -> {"Q", "T", "sellable", "feeBps", "before", "inSlot"} or None if unknown."""
+        sender), or after all of them with `last` (a launch, where snipers outbid us).
+        -> {"Q", "T", "sellable", "feeBps", "before", "inSlot"} or None if unknown."""
         with self.lock:
             cur = self.curves.get(mint)
             h = list(self.hist.get(mint) or ())
@@ -823,7 +824,7 @@ class TradeStream:
                 prev = e
             elif e[1] == land_slot:
                 same.append(e)
-        k = rng.randint(0, len(same)) if same else 0
+        k = (len(same) if last else rng.randint(0, len(same))) if same else 0
         e = same[k - 1] if k else prev
         if e is None:
             if cur["slot"] >= land_slot:  # it traded at or after our slot and its history doesn't reach back

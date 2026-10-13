@@ -178,7 +178,8 @@ the same feed would see.
 | Cost | How it is modelled on pump.fun |
 |---|---|
 | Curve fee | the coin's own: 0.95% protocol + its creator fee, from its on-chain trades; 1.25% until one has been seen |
-| Graduated (PumpSwap) | the pool's own LP + protocol + coin-creator fee (0.30–1.25% seen) when its pool is streamed; else 1.25% |
+| Graduated (PumpSwap) | priced on the pool itself (streamed, or read from Solana); its own LP + protocol + coin-creator fee (0.30–1.25% seen) once one of its trades has been seen, else 1.25% |
+| Launch | in a coin's first 15 s an order lands behind every other trade in its slot (snipers outbid us) |
 | Landing a transaction | measured: the 75th percentile of what recent pump.fun trades paid (network + priority fee + tips), reverted ones included; *Fee per tx* ($0.05) until 30 have been read |
 | Latency | 750 ms ± 200 ms (*Latency jitter* 400) after the signal, then priced as the chain stood in that slot; the lab uses the average |
 | Dropped transactions | 5% of sends never land and go again 1 s later (at most 3 times); an estimate until `calibrate` measures it |
@@ -208,9 +209,23 @@ fees are the pool's own (LP 0.20% + protocol 0.05% + a coin-creator fee of 0–0
 PumpSwap is several times the curve's traffic and mostly coins nobody here trades, so only *PumpSwap pools
 streamed* pools (25 by default) are subscribed: held graduated coins first, then the most recently traded ones in
 the trading universe. A coin that graduates while watched joins straight away (the migration event names its pool).
-Graduated coins whose pool isn't streamed still fill on a fresh API read with a modelled pool. Each streamed pool
-adds about 10 kB/s on the websocket (every transaction touching it, failed ones included); 94 pools took 1.1 MB/s
-and 7% of a CPU core here, so keep the number low on Render's 0.1 CPU.
+Each streamed pool adds about 10 kB/s on the websocket (every transaction touching it, failed ones included); 94 pools
+took 1.1 MB/s and 7% of a CPU core here, so keep the number low on Render's 0.1 CPU.
+
+A graduated coin whose pool isn't streamed is read from Solana for fills and for marking held positions (the pool's
+vaults plus its virtual reserve: two RPC calls, matching the pool's own trade events exactly). **A graduated coin is
+never bought on the pump.fun API's price**: with no pool price, there is no entry (live, in the lab and in the edge
+map), and a buy whose pool can't be read fails. Why: coins that complete their curve in the launch transaction open
+on PumpSwap at the graduation price and trade ×100 higher seconds later, while the API still shows the graduation
+price. On 13 October the Render service bought ADTF at age 0 on the API's $44.5k market cap and "sold" it 2 s later
+for +16,314%, in six strategies at once; such coins made 19 of the trades under 3 s and averaged +5,393%. Recordings
+made before pools were priced therefore offer the lab no graduated coins.
+
+**Snipers at launch.** A launch's first slots belong to bots that pay big tips (and the creator's own buy, which is
+in the launch transaction). An order already fills after every trade of earlier slots, so those buys are priced in,
+but within its own slot it normally lands at a random place. For a coin's first *Launch competition* seconds (15) it
+lands behind every other trade in its slot instead: our fee, the 75th percentile of ordinary trades, doesn't beat a
+sniper's. Hovering a fill shows its place ("after 10 of the 10 other trades").
 
 Set `SOLANA_RPC_URL` to a private RPC (a free Helius or QuickNode endpoint) for reliability; without it the
 public `api.mainnet-beta.solana.com` is used, which rate-limits and may refuse some cloud servers. If Solana
@@ -314,8 +329,8 @@ python -m ponspaper calibrate --keypair C:\path\wallet.json --live --size-sol 0.
   or sent. Run it yourself, on your PC: the paper trader never trades for real.
 
 Limitations:
-- Graduated coins fill on their PumpSwap pool only while it is one of the streamed pools; the others fill on a fresh
-  pump.fun API read with a modelled pool depth.
+- A graduated coin's pool must be known (API `pool_address` or the migration event) and readable; otherwise it isn't
+  traded. Selling a held one falls back to a fresh API read if Solana can't be reached.
 - Coins paired with tokens other than SOL are outside the default universe and are not read from Solana.
 - Request load: about 3 requests/second to pump.fun plus about 1/second to Solana. If pump.fun starts refusing
   requests, raise the poll interval in Settings.

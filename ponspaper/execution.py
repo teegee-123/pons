@@ -150,15 +150,25 @@ class LiveExecutor:
         if not rest:
             return
         t0 = time.time()
-        states = self.engine.chain.states(list(rest.values()))
+        ds = list(rest.values())
+        states = self.engine.chain.states(ds)
+        states.update(self.engine.chain.pool_states(ds))
         t = self._read_time(t0)
         for i, o in enumerate(orders):
             d = rest.get(o["addr"])
             st = states.get(d["address"]) if d else None
-            if st is None:  # graduated or unreadable: filled from a fresh API read instead
-                continue
-            v = Venue("curve", st["Q"], st["T"], st["sellable"], _fee(None, d, ex), d.get("creatorTaxBps") or 0,
-                      src="chain")
+            if st is None:
+                if d is not None and d.get("stage") == "graduated" and o["side"] == "buy":
+                    # the API's price of a just-graduated coin can be far off the pool's (coins that complete their
+                    # curve at launch trade x100 higher on PumpSwap seconds later): no pool, no buy
+                    results[i] = _result(False, t, "chain", qu=d.get("quoteUsd"), err="graduated: pool not readable")
+                continue  # curve unreadable / sells: a fresh API read is the next best thing
+            if st["kind"] == "pool":
+                fee = d["poolFeeBps"] if d.get("poolFeeBps") is not None else ex["hookFeeBps"]
+                v = Venue("pool", st["Q"], st["T"], float("inf"), fee, d.get("creatorTaxBps") or 0, src="chain")
+            else:
+                v = Venue("curve", st["Q"], st["T"], st["sellable"], _fee(None, d, ex), d.get("creatorTaxBps") or 0,
+                          src="chain")
             results[i] = fill_with_venue(o, v, d.get("quoteUsd"), ex, t)
 
     def _stream_fill(self, o, d, ex, now):
@@ -177,7 +187,10 @@ class LiveExecutor:
         if stream.max_slot <= o["land_slot"] and now < o["settle_by"]:
             o["wake"] = now + 0.1
             return WAIT
-        st = stream.landing_state(o["addr"], o["land_slot"], self.rng)
+        # in a coin's first launchCompetitionSec, snipers paying bigger tips get in first: land behind the whole slot
+        launch = float(ex.get("launchCompetitionSec") or 0)
+        last = launch > 0 and o["due"] - (d.get("createdAt") or 0) < launch
+        st = stream.landing_state(o["addr"], o["land_slot"], self.rng, last=last)
         if st is None:
             return None
         if st["pool"]:

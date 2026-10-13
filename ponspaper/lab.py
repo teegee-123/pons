@@ -35,6 +35,7 @@ import statistics
 import time
 
 from . import strategy as S
+from . import venue as V
 from .market import Market
 from .sim import FEE_ON_TOP, model_venue, sell_gross
 
@@ -143,6 +144,8 @@ class Dataset:
                 f = tok.features(t)
                 if not S.passes(universe, f):
                     continue
+                if V.PUMP and tok.d.get("stage") == "graduated" and not tok.d.get("pool"):
+                    continue  # as live: a graduated coin is only bought on a real pool price
                 last_c[i] = t
                 self.cands.append((t, i, tuple(f.get(k) for k in FEAT_KEYS)))
             if yield_every and time.time() - t_yield > 0.25:  # be gentle with a shared CPU

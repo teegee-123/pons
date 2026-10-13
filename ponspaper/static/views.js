@@ -118,6 +118,7 @@ const EX_META = {
   dropPct: ["Dropped transactions", "%", "Chance a sent transaction never lands; it is sent again after the retry delay (at most 3 times). 0 = every transaction lands"],
   dropRetryMs: ["Resend after", "ms", "How long until a dropped transaction is noticed and sent again"],
   accountRentSol: ["Token account rent", "SOL", "Locked by each buy's new token account and returned when the position is sold (cash only, not a cost)"],
+  launchCompetitionSec: ["Launch competition", "s", "For this long after a coin launches, an order lands behind every other trade in its slot (snipers pay bigger tips) instead of at a random place in it. 0 = off"],
 };
 const EVO_META = {
   population: ["Auto population", "#", "Number of auto strategies running at once"],

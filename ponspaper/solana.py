@@ -5,8 +5,9 @@ Bonding curve: the curve account's virtual/real reserves and `complete` flag. Th
 constant product on the virtual reserves plus 0.95% protocol + 0.30% creator fee on the SOL side; that reproduces
 real on-chain buys to the token. A whole batch is one getMultipleAccounts call (up to 100 accounts).
 
-Graduated coins are not read here: PumpSwap trades don't match constant product on the pool's vault balances
-(checked against real swaps), so those fills use a fresh pump.fun API read instead.
+Graduated coins: their PumpSwap pool (pool_states). PumpSwap prices with constant product on (quote vault + the
+pool's virtual quote reserve, base vault); read that way, the pool matches the state its own trade events report
+exactly (checked live), where the vault balances alone are 10-25% off.
 
 The RPC endpoint is SOLANA_RPC_URL (e.g. a free Helius/QuickNode URL) or the public mainnet RPC. The URL is never
 stored in the config or shown on the dashboard, since it usually carries an API key.
@@ -18,7 +19,13 @@ import urllib.parse
 
 PUBLIC_RPC = "https://api.mainnet-beta.solana.com"
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 TOKEN_DECIMALS, SOL_DECIMALS = 6, 9
+
+
+def _b58(b):
+    from .pumpstream import b58
+    return b58(bytes(b))
 
 
 def rpc_url():
@@ -52,6 +59,37 @@ class SolanaChain:
             for key, acc in zip(chunk, (r.get("result") or {}).get("value") or []):
                 if acc and acc.get("data"):
                     out[key] = (acc.get("owner"), base64.b64decode(acc["data"][0]))
+        return out
+
+    def pool_states(self, tokens):
+        """tokens: graduated pump.fun token dicts with a poolAddress -> {address: {"kind": "pool", "Q": quote vault +
+        virtual quote reserve (SOL), "T": base vault (tokens)}}. Two RPC calls: the pools, then their vaults. Pool
+        layout (pump_amm IDL, after the 8-byte discriminator): pool_bump u8, index u16, creator, base_mint,
+        quote_mint, lp_mint, pool_base_token_account @139, pool_quote_token_account @171, lp_supply, coin_creator,
+        is_mayhem_mode, is_cashback_coin, virtual_quote_reserves i128 @245."""
+        toks = [d for d in tokens if d.get("stage") == "graduated" and d.get("poolAddress")
+                and (d.get("quote") or {}).get("symbol") == "SOL"]
+        if not toks:
+            return {}
+        pools = self._accounts([d["poolAddress"] for d in toks])
+        vaults = {}
+        for d in toks:
+            acc = pools.get(d["poolAddress"])
+            if acc and acc[0] == AMM_PROGRAM and len(acc[1]) >= 261:
+                lo, hi = struct.unpack_from("<Qq", acc[1], 245)
+                vaults[d["address"]] = (_b58(acc[1][139:171]), _b58(acc[1][171:203]), lo + (hi << 64))
+        if not vaults:
+            return {}
+        bal = self._accounts([k for v in vaults.values() for k in v[:2]])
+        out = {}
+        for addr, (base_v, quote_v, vq) in vaults.items():
+            b, q = bal.get(base_v), bal.get(quote_v)
+            if not b or not q or len(b[1]) < 72 or len(q[1]) < 72:
+                continue
+            base = struct.unpack_from("<Q", b[1], 64)[0]   # token account: mint, owner, amount
+            quote = struct.unpack_from("<Q", q[1], 64)[0]
+            if base and quote + vq > 0:
+                out[addr] = {"kind": "pool", "Q": (quote + vq) / 10 ** SOL_DECIMALS, "T": base / 10 ** TOKEN_DECIMALS}
         return out
 
     def states(self, tokens):

@@ -49,6 +49,7 @@ DEFAULT_CONFIG = {
         "dropPct": 0.0,            # chance a sent transaction never lands and is sent again dropRetryMs later (max 3x)
         "dropRetryMs": 1000,
         "accountRentSol": 0.0,     # locked by a buy's new token account, returned when the position is sold
+        "launchCompetitionSec": 0,  # pump.fun: in a coin's first seconds, orders land behind every trade in their slot
     },
     "universe": {"quote": {"in": ["ETH"]}, "ageMin": {"min": None, "max": 1440}},
     "sizing": {"sizeUsd": 50.0, "maxOpen": 5, "bankrollUsd": 1000.0, "cooldownMin": 60.0},
@@ -598,9 +599,9 @@ class Engine:
         return out
 
     def _chain_marks(self):
-        """pump.fun: the bonding curves of held coins and of coins the edge map is about to value, read from Solana
-        -> {addr: (token dict, state)}, so exits and edge samples use live chain state (at most 2 RPC calls). Never
-        raises: what Solana can't answer falls back to API refreshes."""
+        """pump.fun: the bonding curves / PumpSwap pools of held coins and of coins the edge map is about to value,
+        read from Solana -> {addr: (token dict, state)}, so exits and edge samples use live chain state (a few RPC
+        calls). Never raises: what Solana can't answer falls back to API refreshes."""
         with self.lock:
             held = self._held_addrs()
             want = list(held) + [a for a in self.edge.due_addrs(time.time(), self.market) if a not in held]
@@ -610,6 +611,7 @@ class Engine:
             return {}
         try:
             states = self.chain.states(ds)
+            states.update(self.chain.pool_states(ds))
         except Exception as e:
             self.status["lastError"] = f"{_iso(time.time())} Solana read failed: {e!r}"
             return {}
@@ -627,9 +629,11 @@ class Engine:
         marked = chain_fut.result() if chain_fut is not None else {}
         if marked:  # chain state on top of the newest API data for each held coin
             now = time.time()
-            items = [pumpfun.apply_state(d, marked[a][1], now) if (a := V.addr_key(d.get("address"))) in marked else d
-                     for d in items]
-            items += [pumpfun.apply_state(d, st, now) for a, (d, st) in marked.items() if a not in listed]
+
+            def on_chain(d, st):
+                return pumpfun.apply_pool(d, st, d.get("lastTradeAt") or now) if st["kind"] == "pool" else pumpfun.apply_state(d, st, now)
+            items = [on_chain(d, marked[a][1]) if (a := V.addr_key(d.get("address"))) in marked else d for d in items]
+            items += [on_chain(d, st) for a, (d, st) in marked.items() if a not in listed]
         fresh = listed | set(marked)
         with self.lock:
             now = time.time()
@@ -758,6 +762,8 @@ class Engine:
             f = feats.get(tok.addr)
             if f is None or not S.passes(uni, f):
                 continue
+            if V.PUMP and tok.d.get("stage") == "graduated" and not tok.d.get("pool"):
+                continue  # no real pool price (only the API's, which can be far off): nothing to buy at
             self.edge.maybe_sample(tok, f, now, ex, self.feed_lag())
             for run in runs:
                 sp, pf = run.spec, run.pf
