@@ -100,7 +100,7 @@ async function renderTrades() {
       <td class="dim">${esc(t.reason)}</td><td class="dim">${esc(t.src)}</td></tr>`).join("") || `<tr><td colspan="13" class="empty">No closed trades yet.</td></tr>`);
   $("#fillsTbl").innerHTML = `<tr><th>Time</th><th>Strategy</th><th>Side</th><th>Token</th><th>Result</th><th class="n">Latency</th><th class="n">USD</th><th class="n">Drift</th><th class="n">P&L</th><th>Reason</th></tr>` +
     (v.fills.map(f => `<tr><td>${fTime(f.t)}</td><td>${esc(f.name)}</td><td>${f.side}</td><td><b>${esc(f.sym)}</b></td>
-      <td${f.slot ? ` data-tip="landed in slot ${f.slot[0]}, ${f.slot[2] ? `after ${f.slot[1]} of the ${f.slot[2]} other trades of this coin in that slot` : "the only trade of this coin in that slot"}"` : ""}>${f.ok ? `filled <span class="dim">(${esc(f.src)})</span>` : `<span class="neg">reverted</span> <span class="dim">${esc(f.err || "")}</span>`}</td>
+      <td${f.slot || f.resends ? ` data-tip="${f.resends ? `dropped and sent again ${f.resends}×. ` : ""}${f.slot ? `landed in slot ${f.slot[0]}, ${f.slot[2] ? `after ${f.slot[1]} of the ${f.slot[2]} other trades of this coin in that slot` : "the only trade of this coin in that slot"}` : ""}"` : ""}>${f.ok ? `filled <span class="dim">(${esc(f.src)})</span>` : `<span class="neg">reverted</span> <span class="dim">${esc(f.err || "")}</span>`}</td>
       <td class="n">${f.latMs}ms</td><td class="n">${fUsd(f.usd)}</td><td class="n" data-tip="Spot at fill vs spot the strategy saw when it decided">${fPct(f.drift, 2)}</td>
       <td class="n ${cls(f.pnl)}">${f.pnl == null ? "" : fSUsd(f.pnl)}</td><td class="dim">${esc(f.reason)}</td></tr>`).join("") || `<tr><td colspan="10" class="empty">No fills yet.</td></tr>`);
 }
@@ -115,6 +115,9 @@ const EX_META = {
   protocolFeeBps: ["Curve protocol fee", "bps", "On-chain value is 100 (1%), charged on buys and sells, plus the token's creator tax"],
   hookFeeBps: ["Graduated pool fee", "bps", "v4 hook fee on graduated tokens (on-chain: 100), plus creator tax"],
   gradLiquidityMult: ["Graduated depth ×", "", "Scales the modelled v4 pool depth used for marking graduated positions"],
+  dropPct: ["Dropped transactions", "%", "Chance a sent transaction never lands; it is sent again after the retry delay (at most 3 times). 0 = every transaction lands"],
+  dropRetryMs: ["Resend after", "ms", "How long until a dropped transaction is noticed and sent again"],
+  accountRentSol: ["Token account rent", "SOL", "Locked by each buy's new token account and returned when the position is sold (cash only, not a cost)"],
 };
 const EVO_META = {
   population: ["Auto population", "#", "Number of auto strategies running at once"],
@@ -178,7 +181,8 @@ const chk = (id, l, h, v) => `<label data-tip="${esc(h)}">${esc(l)}</label><inpu
 const PUMP_META = {
   "execution.latencyMs": ["Latency", "ms", "Delay from the strategy seeing data (a trade arriving on the chain stream, or a poll) to its transaction landing. Fills use the bonding curve at that moment."],
   "execution.latencyJitterMs": ["Latency jitter", "ms", "How long a transaction takes to land varies (which slot it makes; Solana slots are about 0.21 s): each order lands up to half this earlier or later than the latency. The lab uses the average"],
-  "execution.gasUsd": ["Fee per tx", "$", "Solana base + priority fee (or tip), charged on every transaction including reverted ones"],
+  "execution.gasUsd": ["Fee per tx", "$", "Solana base + priority fee (or tip), charged on every transaction including reverted ones. With 'Measured transaction cost' on, only used until enough real trades have been read"],
+  "execution.dropPct": ["Dropped transactions", "%", "Chance a sent transaction never lands and is sent again after the retry delay (at most 3 times). 5% is an estimate until real orders measure it"],
   "execution.protocolFeeBps": ["Curve fee", "bps", "Bonding-curve fee on buys and sells: 0.95% protocol + 0.30% creator = 125. Used until the chain stream has seen one of the coin's own trades, whose fee then applies (some coins charge more or less)"],
   "execution.hookFeeBps": ["Graduated pool fee", "bps", "PumpSwap fee after graduation (dynamic; about 1.25% at low market caps)"],
   "execution.gradLiquidityMult": ["Graduated depth ×", "", "Scales the modelled PumpSwap pool depth (seeded with the curve's closing price and 206.9M tokens)"],
@@ -189,6 +193,8 @@ function renderSettings() {
   const c = S.state.cfg, pump = S.meta.venue.id === "pumpfun";
   $("#uniForm").innerHTML = filterForm(c.universe, "uni");
   $("#exForm").innerHTML = Object.entries(EX_META).map(([k, m]) => fld("execution." + k, vmeta("execution." + k, m), c.execution[k])).join("") +
+    (pump ? chk("execution.measuredTxCost", "Measured transaction cost", "Charge every order what recent real pump.fun trades paid to land (network fee + priority fee + tips, one trade read from Solana every 8 s), at the percentile below, instead of the fixed fee per tx", c.execution.measuredTxCost) +
+      fld("execution.txCostPct", ["Cost percentile", "%", "Which percentile of recent trades' landing cost to pay: 50 = a typical trade, 75 = land like the faster quarter, 90 = like the most aggressive"], c.execution.txCostPct) : "") +
     (pump ? chk("execution.useChainQuotes", "Fill on live Solana state", "Each order fills on the coin's bonding curve when it lands: the curve after its latest trade on the chain stream, else read from Solana (graduated coins: a fresh pump.fun API read); off = fill on the last poll", c.execution.useChainQuotes)
       : chk("execution.useChainQuotes", "Fill on live on-chain quotes", "Off = fill from API data with the curve model (latency then has little effect)", c.execution.useChainQuotes));
   $("#sizeForm").innerHTML = Object.entries(S.meta.sizing).map(([k, d]) => fld("sizing." + k, [d.label, d.unit, d.help], c.sizing[k])).join("");
@@ -204,7 +210,8 @@ function renderSettings() {
     chk("edge.fillLatency", "Edge buys wait for latency", "Each sample buys like a real order: at the first quote after the order latency, not at the price that triggered it. Changing it restarts the edge map", c.edge.fillLatency) +
     chk("record.enabled", "Record snapshots", "Write every poll to data/snapshots for backtests", c.record.enabled) +
     (pump ? chk("stream.enabled", "On-chain trade stream", "Every curve trade, launch and graduation from Solana: Yellowstone gRPC when SOLANA_GRPC_URL is set, else the free websocket (SOLANA_WS_URL, SOLANA_RPC_URL or the public endpoint). Strategies react to it, fills and marks use it, and it feeds the per-trade signals", c.stream.enabled) +
-      fld("stream.reactMs", ["React every", "ms", "How often new chain trades are applied: exits and entries run on the coins that traded"], c.stream.reactMs) : "");
+      fld("stream.reactMs", ["React every", "ms", "How often new chain trades are applied: exits and entries run on the coins that traded"], c.stream.reactMs) +
+      fld("stream.maxPools", ["PumpSwap pools streamed", "#", "Graduated coins whose PumpSwap pool is streamed (held ones first, then the most recently traded), so they fill on the real pool. Each adds about 10 kB/s on the websocket; 0 = none (graduated coins fill on the API and a modelled pool)"], c.stream.maxPools) : "");
   $("#setMsg").textContent = "";
   renderStorage();
 }
@@ -249,7 +256,7 @@ $("#btnSaveSettings").onclick = async () => {
     const [a, b] = i.dataset.s.split(".");
     const v = i.type === "checkbox" ? i.checked : (i.value === "" ? null : Number(i.value));
     if (v === null) return;
-    (patch[a] ??= {})[b] = (a === "sizing" && b === "maxOpen") || ["population", "minTrades", "idleEpochs", "pages", "elite", "tournament", "minValTrades", "promoteCount", "maxGensPerData", "folds", "stressLatencyMs", "stressFeeBps", "ledgerSize", "ledgerAdd", "provenSegments", "provenTrades", "parentMinTrades", "maxChildren", "dropBest"].includes(b) ? Math.round(v) : v;
+    (patch[a] ??= {})[b] = (a === "sizing" && b === "maxOpen") || ["population", "minTrades", "idleEpochs", "pages", "elite", "tournament", "minValTrades", "promoteCount", "maxGensPerData", "folds", "stressLatencyMs", "stressFeeBps", "ledgerSize", "ledgerAdd", "provenSegments", "provenTrades", "parentMinTrades", "maxChildren", "dropBest", "maxPools"].includes(b) ? Math.round(v) : v;
   });
   await api("/api/settings", patch);
   await refresh(); renderSettings();

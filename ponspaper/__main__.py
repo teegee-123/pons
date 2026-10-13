@@ -76,8 +76,8 @@ def cmd_replay(a):
             eng.upsert_strategy({k: v for k, v in sp.items() if k != "id"})
     t0, n, first, last = time.time(), 0, None, None
     print(f"replaying {len(files)} file(s) with {len(eng.runs)} strategies...")
-    for t, items, ticks, gap, lag in snapshot_items(files):
-        eng.tick(items, t, tick_rows=ticks, tick_gap=gap, feed_lag=lag)
+    for t, items, ticks, gap, env in snapshot_items(files):
+        eng.tick(items, t, tick_rows=ticks, tick_gap=gap, env=env)
         first = first or t
         last = t
         n += 1
@@ -158,6 +158,11 @@ def cmd_ga(a):
     return 0
 
 
+def cmd_calibrate(a):
+    from .calibrate import calibrate
+    return calibrate(a)
+
+
 def cmd_export(a):
     from .export import export
     export(a.url, a.out, a.recording)
@@ -187,6 +192,19 @@ def main(argv=None):
     g.add_argument("--population", type=int, default=80)
     g.add_argument("--top", type=int, default=10)
     g.add_argument("--seed", type=int, default=None)
+    c = sub.add_parser("calibrate", help="pump.fun: measure real landing time, drops and costs with small real orders "
+                                         "from your wallet (dry run unless --live)")
+    c.add_argument("--keypair", help="your wallet's keypair file (Solana CLI JSON); only read to sign")
+    c.add_argument("--pubkey", help="dry run without a keypair: simulate as this wallet address")
+    c.add_argument("--live", action="store_true", help="send real transactions (asks you to type YES)")
+    c.add_argument("--yes", action="store_true", help="skip the YES prompt")
+    c.add_argument("--size-sol", type=float, default=0.02, help="SOL per buy (at most 0.1)")
+    c.add_argument("--trades", type=int, default=10, help="round trips (at most 50)")
+    c.add_argument("--hold", type=float, default=5.0, help="seconds between a buy landing and its sell")
+    c.add_argument("--slippage", type=float, default=10.0, help="buy slippage limit, %% (as in Settings)")
+    c.add_argument("--sell-slippage", type=float, default=40.0, help="sell slippage limit, %%")
+    c.add_argument("--fee-pct", type=float, default=75.0, help="priority fee: this percentile of recent trades' landing cost")
+    c.add_argument("--max-loss-sol", type=float, default=0.05, help="stop when the wallet is down this much")
     x = sub.add_parser("export", help="save strategies, rules and trade history from a running trader (local or Render)")
     x.add_argument("url", help="the trader's address, e.g. https://pumpfun-paper-trader.onrender.com")
     x.add_argument("--out", default="exports", help="folder to write into (default: exports)")
@@ -194,6 +212,8 @@ def main(argv=None):
     a = p.parse_args(argv)
     if a.cmd == "export":
         return cmd_export(a)
+    if a.cmd == "calibrate":
+        return cmd_calibrate(a)
     if a.cmd == "replay":
         return cmd_replay(a)
     if a.cmd == "ga":

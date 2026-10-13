@@ -170,17 +170,47 @@ earlier. Measured on live fills, that was optimistic in fast markets: one 21-min
 1.5% worse on average (p90 5%), a later 6-minute run's on average about the same, but 1 in 10 sells 2.5% worse or
 more. The cost is in the tail, where stop losses meet falling prices.
 
-Pricing is constant product on the virtual reserves with the fees the program charges, which reproduces real
-on-chain trades to the token. Open positions are marked on the stream's latest curve, so take profit / stop loss act
-on what a bot on the same feed would see.
+Pricing is constant product on the virtual reserves with the fees the program charges: a buy's fee on top of what
+goes into the curve, a sell's out of what comes back. Simulated pump.fun buys and sells (`calibrate`, below) match it
+to 0.0001%. Open positions are marked on the stream's latest curve, so take profit / stop loss act on what a bot on
+the same feed would see.
 
 | Cost | How it is modelled on pump.fun |
 |---|---|
 | Curve fee | the coin's own: 0.95% protocol + its creator fee, from its on-chain trades; 1.25% until one has been seen |
-| Graduated (PumpSwap) | 1.25% by default. The real fee is tiered by market cap (about 1.15% at $200k, 0.3% above $20M) |
-| Solana fee | $0.05 per transaction (base + priority fee), reverted ones included |
+| Graduated (PumpSwap) | the pool's own LP + protocol + coin-creator fee (0.30–1.25% seen) when its pool is streamed; else 1.25% |
+| Landing a transaction | measured: the 75th percentile of what recent pump.fun trades paid (network + priority fee + tips), reverted ones included; *Fee per tx* ($0.05) until 30 have been read |
 | Latency | 750 ms ± 200 ms (*Latency jitter* 400) after the signal, then priced as the chain stood in that slot; the lab uses the average |
+| Dropped transactions | 5% of sends never land and go again 1 s later (at most 3 times); an estimate until `calibrate` measures it |
+| Token account rent | 0.00151384 SOL locked per open position, returned on the sell (cash only, not a cost) |
 | Slippage limits | as on pons |
+
+**Transaction costs, measured.** Every 8 seconds one recent pump.fun trade is read from Solana and what it paid to
+land is noted: the network fee (5,000 lamports a signature plus the priority fee) and its tips, i.e. small SOL
+transfers to Jito and other landing services. Transfers over 0.002 SOL are left out: those are trading platforms'
+fees, which a bot of your own doesn't pay. Orders pay the *Cost percentile* (75 by default: land like the faster
+quarter of traders) of the last 500. On 79 trades read in October 2026: median 0.000045 SOL, 75th percentile
+0.000105 SOL (about $0.01), 90th 0.001 SOL, so the old flat $0.05 was about 5× too much for most orders. The cost is
+recorded, so replays and the lab charge what live trading did. Settings → Execution: *Measured transaction cost*.
+
+**Dropped transactions.** A transaction can fail to land at all (no fee is charged then); the sender notices and
+sends it again. Each send is dropped with *Dropped transactions* (5%) and resent after *Resend after* (1 s), at most 3
+times. The 5% is an estimate: `calibrate` measures your own rate. Hovering a fill shows any resends.
+
+**Token account rent.** A buy creates the token account that holds the coin: 0.00151384 SOL of rent (a 170-byte
+Token-2022 account, as real pump.fun buys pay it in October 2026), returned when the account is closed with the sell.
+It is cash locked while a position is open, not a cost, so it only affects how much cash is free for new entries.
+
+**Graduated coins trade on their PumpSwap pool.** PumpSwap prices with constant product on (quote reserve + the
+pool's virtual quote reserve, token reserve); plain constant product on the vault balances is 10–25% off, which is
+why graduated coins used to be modelled. With the virtual reserve, the model reproduces real swaps exactly. The
+fees are the pool's own (LP 0.20% + protocol 0.05% + a coin-creator fee of 0–0.95%), read from its trades. All of
+PumpSwap is several times the curve's traffic and mostly coins nobody here trades, so only *PumpSwap pools
+streamed* pools (25 by default) are subscribed: held graduated coins first, then the most recently traded ones in
+the trading universe. A coin that graduates while watched joins straight away (the migration event names its pool).
+Graduated coins whose pool isn't streamed still fill on a fresh API read with a modelled pool. Each streamed pool
+adds about 10 kB/s on the websocket (every transaction touching it, failed ones included); 94 pools took 1.1 MB/s
+and 7% of a CPU core here, so keep the number low on Render's 0.1 CPU.
 
 Set `SOLANA_RPC_URL` to a private RPC (a free Helius or QuickNode endpoint) for reliability; without it the
 public `api.mainnet-beta.solana.com` is used, which rate-limits and may refuse some cloud servers. If Solana
@@ -206,7 +236,8 @@ biggest buy, volume spike, creator sold) come from the trade stream and stay emp
 | Launch buys | share of supply wallets other than the creator bought in the first 3 s: snipers and bundled launches (trade stream) |
 
 The last four need every trade since launch, so they are only known for coins the stream has watched since launch.
-They stop at graduation, like the other per-trade signals: PumpSwap trades aren't streamed.
+They stop at graduation, like the other per-trade signals: PumpSwap pools are streamed for prices, not (yet) for
+per-trade signals.
 
 **Coins it can't price are left out.** The default universe skips two kinds of coin, because neither paper fills
 nor real trades make sense on them (both can be switched back on under Settings → Trading universe):
@@ -258,9 +289,33 @@ With the stream, each recorded coin's trades are recorded too (time, side, USD, 
 each burst of trades, so the lab trains on the same per-trade signals and price path that live trading saw. That
 roughly doubles the recording, from about 3 to 6 MB an hour.
 
+**Calibrating with real orders.** Everything above is a model; only real orders show your own setup's landing time,
+drop rate and costs. `calibrate` sends small real round trips from your wallet and measures each against the model:
+
+```
+pip install solders
+set PONS_VENUE=pumpfun
+python -m ponspaper calibrate --keypair C:\path\wallet.json
+python -m ponspaper calibrate --keypair C:\path\wallet.json --live --size-sol 0.02 --trades 10
+```
+
+- **Dry run (default):** picks an actively traded coin, builds the real buy and sell transactions and has a Solana
+  node simulate them, then compares the simulated tokens / SOL with the paper pricing on the same curve. Nothing is
+  signed or sent: simulation uses a blank signature with signature checks off (a signed transaction sent "just to
+  simulate" could be broadcast by the node). The sell is simulated as a wallet that holds the coin.
+- **`--live`:** after you type YES, buys `--size-sol` (at most 0.1 SOL) of an actively traded curve coin with the
+  paper trader's slippage limit, holds `--hold` seconds, sells everything and closes the token account (the rent comes
+  back). Each transaction is resent every second until it lands. Per order it records how long after signing it
+  landed (its trade on the stream, less the stream's lag), the slot, resends (only those sent before it landed),
+  failures, the fee paid, how far the price moved while landing, and the real fill vs the paper pricing on the curve
+  right before it. It stops after `--trades` (at most 50) or when the wallet is down `--max-loss-sol` (0.05).
+- **Output:** a summary with suggested *Latency*, *Latency jitter* and *Dropped transactions* settings, and every
+  order in `calibration.json` in the data folder. The keypair file is only read to sign; it is never copied, printed
+  or sent. Run it yourself, on your PC: the paper trader never trades for real.
+
 Limitations:
-- Graduated coins are not read from Solana or streamed. PumpSwap swaps don't follow constant product on the pool's
-  vault balances (checked against real swaps), so they fill on a fresh pump.fun API read with a modelled pool depth.
+- Graduated coins fill on their PumpSwap pool only while it is one of the streamed pools; the others fill on a fresh
+  pump.fun API read with a modelled pool depth.
 - Coins paired with tokens other than SOL are outside the default universe and are not read from Solana.
 - Request load: about 3 requests/second to pump.fun plus about 1/second to Solana. If pump.fun starts refusing
   requests, raise the poll interval in Settings.

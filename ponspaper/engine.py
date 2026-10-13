@@ -44,6 +44,11 @@ DEFAULT_CONFIG = {
         "hookFeeBps": 100,         # graduated v4 hook fee (read on-chain: 100)
         "gradLiquidityMult": 1.0,  # scales the modelled v4 pool depth (model fills/marks only)
         "useChainQuotes": True,    # fill against live on-chain state; off = model fills from API data
+        "measuredTxCost": False,   # pump.fun: charge what recent on-chain trades paid to land instead of gasUsd
+        "txCostPct": 75,           # ...at this percentile of them
+        "dropPct": 0.0,            # chance a sent transaction never lands and is sent again dropRetryMs later (max 3x)
+        "dropRetryMs": 1000,
+        "accountRentSol": 0.0,     # locked by a buy's new token account, returned when the position is sold
     },
     "universe": {"quote": {"in": ["ETH"]}, "ageMin": {"min": None, "max": 1440}},
     "sizing": {"sizeUsd": 50.0, "maxOpen": 5, "bankrollUsd": 1000.0, "cooldownMin": 60.0},
@@ -60,7 +65,8 @@ DEFAULT_CONFIG = {
              "fillLatency": False},  # buy at the first quote latencyMs after the signal (off on pons, see pumpfun.CONFIG)
     "record": {"enabled": True, "dedupeSec": 0},  # dedupeSec: skip a token's unchanged row for this long
     "ticks": {"enabled": True},
-    "stream": {"enabled": False, "source": "auto", "reactMs": 250},  # pump.fun's on-chain trade stream (pumpfun.CONFIG)
+    "stream": {"enabled": False, "source": "auto", "reactMs": 250,  # pump.fun's on-chain trade stream (pumpfun.CONFIG)
+               "maxPools": 25},  # PumpSwap pools streamed (graduated coins: held first, then the most recently traded)
 }
 
 PONS_SEEDS = [
@@ -189,6 +195,10 @@ class Engine:
         self._stream_up = False
         self._replay_lag = 0.0     # replays: the stream's lag behind the chain, as recorded
         self._rec_lag = (None, 0.0)  # last recorded lag and when
+        self._pools_set = 0.0      # when the PumpSwap pools to stream were last chosen
+        self._replay_cost = None   # replays: the recorded cost of landing a transaction (USD), when measured
+        self._rec_cost = (None, 0.0)
+        self._cost_sampled = 0.0
         if live and V.PUMP:  # Solana reads for fills and open positions; trades come from the stream
             self.chain, self.tickfeed = SolanaChain(self.client, solana_rpc_url()), None
             self.stream = pumpstream.open_stream(self.cfg["stream"], self.client._proxy)
@@ -470,9 +480,16 @@ class Engine:
                                 self._rec_buf.append(json.dumps({"t": round(t0, 2), "xs": 1}, separators=(",", ":")))
                         self.status["streamOutages"] += 1
                     self._stream_up = healthy
-                    trades, creates, completes, gap = stream.drain()
-                    if healthy and (trades or creates or completes or gap):
-                        self._stream_tick(trades, creates, completes, gap, time.time())
+                    every = 2.0 if len(stream.costs) < 30 else 8.0  # warm up quickly, then a sample every 8 s
+                    if healthy and self._pool is not None and t0 - self._cost_sampled >= every:
+                        self._cost_sampled = t0
+                        self._pool.submit(self._sample_cost)
+                    if t0 - self._pools_set >= 10.0:
+                        self._pools_set = t0
+                        stream.set_pools(self._want_pools())
+                    trades, creates, completes, gap, pools, migrations = stream.drain()
+                    if healthy and (trades or creates or completes or gap or pools or migrations):
+                        self._stream_tick(trades, creates, completes, gap, time.time(), pools, migrations)
                         self.status["streamTicks"] += 1
                         self.status["streamTickMs"] = round((time.time() - t0) * 1000)
             except Exception as e:
@@ -480,7 +497,26 @@ class Engine:
             react = max(50.0, float(self.cfg["stream"].get("reactMs") or 250)) / 1000.0
             self.stopping.wait(max(0.02, react - (time.time() - t0)))
 
-    def _stream_tick(self, trades, creates, completes, gap, now):
+    def _want_pools(self):
+        """PumpSwap pools to stream: graduated coins held first, then the graduated coins in the trading universe
+        that traded most recently (stream.maxPools of them, pumpstream.MAX_POOLS at most) -> {pool: mint}. Each pool
+        adds about 10 kB/s on the websocket (every transaction touching it, failed ones included)."""
+        with self.lock:
+            held = self._held_addrs()
+            uni = self.cfg["universe"]
+            grads = [t for t in self.market.tokens.values() if t.d.get("stage") == "graduated" and t.d.get("poolAddress")]
+            now = time.time()
+            ranked = sorted(grads, key=lambda t: (t.addr not in held, -(t.d.get("lastTradeAt") or 0)))
+            cap = min(pumpstream.MAX_POOLS, int(self.cfg["stream"].get("maxPools", 25)))
+            out = {}
+            for t in ranked:
+                if t.addr in held or S.passes(uni, t.features(now)):
+                    out[t.d["poolAddress"]] = t.addr
+                if len(out) >= cap:
+                    break
+            return out
+
+    def _stream_tick(self, trades, creates, completes, gap, now, pools=(), migrations=()):
         with self.lock:
             qu = self.status.get("quoteUsd")
             known = self.market.tokens
@@ -500,11 +536,25 @@ class Engine:
                 d = items.get(c["mint"]) or (known[c["mint"]].d if c["mint"] in known else None)
                 if d is not None and d.get("stage") != "graduated":
                     items[c["mint"]] = pumpfun.graduate(d, c["t"])
+            for m in migrations:  # its PumpSwap pool: streamed from the next pool choice on
+                d = items.get(m["mint"]) or (known[m["mint"]].d if m["mint"] in known else None)
+                if d is not None:
+                    items[m["mint"]] = dict(d, poolAddress=m["pool"])
+                    self._pools_set = 0.0
+            last_pool = {}
+            for e in pools:
+                last_pool[e["mint"]] = e
+            for m, e in last_pool.items():
+                d = items.get(m) or (known[m].d if m in known else None)
+                if d is not None:
+                    items[m] = pumpfun.apply_pool(d, e, e["t"])
             self.tick(list(items.values()), now, listed=set(items), live_ticks=(trades, gap, True))
 
     def _stream_state(self, d):
-        """pump.fun: token dict d with the stream's curve on top (the API's copy lags), or d itself."""
+        """pump.fun: token dict d with the stream's curve or PumpSwap pool on top (the API's copy lags), or d itself."""
         st = self.stream.curve(d.get("address")) if self.stream is not None else None
+        if st is not None and st.get("pool"):
+            return pumpfun.apply_pool(d, st, st["t"])
         if st is None or d.get("stage") == "graduated":
             return d
         if st.get("complete"):
@@ -644,12 +694,13 @@ class Engine:
         return out
 
     # ------------------------------------------------------------------ core tick (live + replay)
-    def tick(self, items, now, listed=None, live_ticks=None, tick_rows=None, tick_gap=False, feed_lag=None):
-        """live_ticks: (decoded trades, gap, ok) from the chain feed; tick_rows: recorded trades (replay);
-        feed_lag: the recorded lag of the trade stream behind the chain (replay)."""
+    def tick(self, items, now, listed=None, live_ticks=None, tick_rows=None, tick_gap=False, env=None):
+        """live_ticks: (decoded trades, gap, ok) from the chain feed; tick_rows: recorded trades (replay); env: the
+        recorded conditions (replay): the trade stream's lag behind the chain, the cost of landing a transaction."""
         with self.lock:
-            if feed_lag is not None:
-                self._replay_lag = feed_lag
+            if env is not None:
+                self._replay_lag = env.get("lag") or 0.0
+                self._replay_cost = env.get("txCost")
             toks = self.market.ingest(items, now)
             rec_ticks = None
             if live_ticks is not None:
@@ -678,7 +729,7 @@ class Engine:
             self._record(rec_items, now, rec_ticks, live_ticks is not None and (live_ticks[1] or not live_ticks[2]))
             if not self.live:
                 self.executor.process(now)
-            ex = self.cfg["execution"]
+            ex = self.ex()
             for d in items:
                 if (d.get("quote") or {}).get("symbol") == V.QUOTE and d.get("quoteUsd"):
                     self.status["quoteUsd"] = d["quoteUsd"]
@@ -732,17 +783,53 @@ class Engine:
         if exp_tokens <= 0:
             return
         oid = S.new_id("o")
+        lat, resends = self._latency(ex)
         run.pf.cash -= size
         run.pf.reserved[oid] = size
         run.pending_tokens.add(tok.addr)
         run.last_entry[tok.addr] = now
         self.executor.submit({
             "id": oid, "sid": run.spec["id"], "side": "buy", "addr": tok.addr, "sym": d.get("symbol"),
-            "t_signal": now, "due": now + self._latency(ex) + self._replay_lag, "size_usd": size, "tokens": None, "pos_id": None,
+            "t_signal": now, "due": now + lat + self._replay_lag, "resends": resends, "size_usd": size, "tokens": None, "pos_id": None,
             "reason": "entry", "sig_spot_usd": spot_usd(d), "expected_out": exp_tokens,
             "tol": ex["buySlippagePct"] / 100.0, "stage": d.get("stage"),
             "feats": {k: (round(f[k], 4) if isinstance(f.get(k), float) else f.get(k)) for k in FEAT_KEEP},
         })
+
+    def tx_cost_usd(self):
+        """USD a transaction costs (charged on every order, reverted ones too): on pump.fun with measuredTxCost, the
+        txCostPct percentile of what recent on-chain pump.fun trades paid to land (network fee + tips), sampled from
+        the trade stream; else gasUsd."""
+        ex = self.cfg["execution"]
+        if not self.live:
+            return self._replay_cost if self._replay_cost is not None else ex["gasUsd"]
+        s, qu = self.stream, self.status.get("quoteUsd")
+        if V.PUMP and ex.get("measuredTxCost") and s is not None and qu:
+            sol = s.tx_cost(ex.get("txCostPct", 75))
+            if sol is not None:
+                return sol * qu
+        return ex["gasUsd"]
+
+    def ex(self):
+        """Execution settings as orders meet them: gasUsd replaced by the measured transaction cost when there is one."""
+        ex = self.cfg["execution"]
+        cost = self.tx_cost_usd()
+        return ex if cost == ex["gasUsd"] else dict(ex, gasUsd=cost)
+
+    def _sample_cost(self):
+        """Read one recent pump.fun trade from Solana and note what it paid to land (pumpstream.landing_cost)."""
+        s = self.stream
+        sig = s.cost_sample_sig() if s is not None else None
+        if sig is None:
+            return
+        try:
+            r = self.chain.client.post_json(self.chain.url, {
+                "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+                "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}]})
+            if r.get("result"):
+                s.costs.append(pumpstream.landing_cost(r["result"]))
+        except Exception:
+            s.cost_errors += 1
 
     def feed_lag(self):
         """Seconds the market data runs behind the chain: the trade stream's measured lag live (0 while it isn't
@@ -754,11 +841,18 @@ class Engine:
         return (s.feed_lag or 0.0) if s is not None and s.healthy() else 0.0
 
     def _latency(self, ex):
-        """Signal -> landing, in seconds: latencyMs, give or take half of latencyJitterMs (a transaction lands in
-        whichever slot it makes; the lab uses the average)."""
+        """-> (signal -> landing in seconds, resends): latencyMs, give or take half of latencyJitterMs (how long a
+        transaction takes to land varies), plus dropRetryMs for each time it was dropped (dropPct each try, at most 3
+        resends: the sender notices it didn't land and sends it again). The lab uses the averages."""
         lat = ex["latencyMs"] / 1000.0
         jit = float(ex.get("latencyJitterMs") or 0) / 1000.0
-        return max(0.0, lat + jit * (self.lat_rng.random() - 0.5)) if jit > 0 else lat
+        if jit > 0:
+            lat = max(0.0, lat + jit * (self.lat_rng.random() - 0.5))
+        p, resends = float(ex.get("dropPct") or 0) / 100.0, 0
+        while p > 0 and resends < 3 and self.lat_rng.random() < p:
+            resends += 1
+            lat += float(ex.get("dropRetryMs") or 1000) / 1000.0
+        return lat, resends
 
     def _submit_sell(self, run, pos, reason, now, ex):
         tok = self.market.get(pos.addr)
@@ -767,9 +861,10 @@ class Engine:
         exp_q = v.sell(pos.tokens) if v else 0.0
         force = pos.sell_fails >= 3
         pos.exiting = True
+        lat, resends = self._latency(ex)
         self.executor.submit({
             "id": S.new_id("o"), "sid": run.spec["id"], "side": "sell", "addr": pos.addr, "sym": pos.symbol,
-            "t_signal": now, "due": now + self._latency(ex) + self._replay_lag, "size_usd": None, "tokens": pos.tokens,
+            "t_signal": now, "due": now + lat + self._replay_lag, "resends": resends, "size_usd": None, "tokens": pos.tokens,
             "pos_id": pos.id, "reason": reason, "sig_spot_usd": spot_usd(d) if d else None, "expected_out": exp_q,
             "tol": 1.0 if force else ex["sellSlippagePct"] / 100.0, "stage": d.get("stage"),
         })
@@ -816,7 +911,7 @@ class Engine:
     # ------------------------------------------------------------------ fills
     def apply_fills(self, orders, results):
         with self.lock:
-            ex = self.cfg["execution"]
+            ex = self.ex()
             gas = ex["gasUsd"]
             for o, r in zip(orders, results):
                 run = self.runs.get(o["sid"])
@@ -824,7 +919,7 @@ class Engine:
                 ev = {"t": r["t_fill"], "sid": o["sid"], "name": run.spec["name"] if run else "(deleted)", "side": o["side"],
                       "sym": o.get("sym"), "addr": o["addr"], "ok": r["ok"], "src": r["src"], "latMs": lat,
                       "reason": o["reason"], "err": r.get("err"), "usd": None, "drift": None, "pnl": None,
-                      "slot": r.get("slot")}
+                      "slot": r.get("slot"), "resends": o.get("resends") or 0}
                 if run is None:
                     self.fills.appendleft(ev)
                     continue
@@ -850,9 +945,11 @@ class Engine:
                     spot_fill = r["spot_quote"] * qu if r["spot_quote"] else None
                     drift = (spot_fill / o["sig_spot_usd"] - 1.0) if (spot_fill and o["sig_spot_usd"]) else None
                     tok = self.market.get(o["addr"])
+                    rent = float(ex.get("accountRentSol") or 0) * qu  # the new token account's rent, back on the sell
+                    pf.cash -= rent
                     pos = Position(id=o["id"], addr=o["addr"], symbol=o.get("sym"), t_entry=r["t_fill"], tokens=r["out"],
                                    cost_usd=used_usd + gas, entry_spot_usd=spot_fill or o["sig_spot_usd"], feats=o["feats"],
-                                   stage=o.get("stage"), entry_drift=drift, fees_usd=fees, src=r["src"])
+                                   stage=o.get("stage"), entry_drift=drift, fees_usd=fees, src=r["src"], rent_usd=rent)
                     if tok:
                         pos.mark_usd = liquidation_usd(tok.d, pos.tokens, ex)
                         pos.mark_ret = pos.mark_usd / pos.cost_usd - 1.0
@@ -878,7 +975,7 @@ class Engine:
                     pnl = proceeds - pos.cost_usd
                     spot_fill = r["spot_quote"] * qu if r["spot_quote"] else None
                     drift = (spot_fill / o["sig_spot_usd"] - 1.0) if (spot_fill and o["sig_spot_usd"]) else None
-                    pf.cash += proceeds
+                    pf.cash += proceeds + (pos.rent_usd or 0.0)  # selling everything closes the token account
                     pf.stats["fees"] += fees
                     del pf.positions[pos.id]
                     tr = {"sid": o["sid"], "name": run.spec["name"], "kind": run.spec["kind"], "sym": pos.symbol,
@@ -1051,10 +1148,20 @@ class Engine:
                 lag = None
             else:
                 self._rec_lag = (lag, now)
-        if rows or tick_rows is not None or tick_gap or lag is not None:
+        cost = None
+        if V.PUMP and self.cfg["execution"].get("measuredTxCost"):  # replays and the lab charge what live did
+            cost = round(self.tx_cost_usd(), 4)
+            last = self._rec_cost[0]
+            if last is not None and abs(cost - last) <= 0.1 * max(last, 1e-6) and now - self._rec_cost[1] < 300:
+                cost = None
+            else:
+                self._rec_cost = (cost, now)
+        if rows or tick_rows is not None or tick_gap or lag is not None or cost is not None:
             rec = {"t": round(now, 2), "v" if V.PUMP else "u": rows}
             if lag is not None:
                 rec["lag"] = lag
+            if cost is not None:
+                rec["fee"] = cost
             if tick_rows is not None:
                 rec["x"] = tick_rows   # trades since the previous poll (present, possibly empty, while the feed works)
             if tick_gap:
@@ -1094,7 +1201,7 @@ class Engine:
                       storageError=getattr(self.store, "last_error", None),
                       executorError=self.executor.last_error,
                       chainCalls=self.chain.calls if self.chain else 0, chainFailures=self.chain.failures if self.chain else 0,
-                      stream=self.stream.view() if self.stream is not None else None,
+                      stream=self.stream.view() if self.stream is not None else None, txCostUsd=self.tx_cost_usd(),
                       httpRequests=self.client.requests if self.client else 0, httpErrors=self.client.errors if self.client else 0,
                       httpErrorKinds=dict(sorted(self.client.error_kinds.items(), key=lambda kv: -kv[1])[:6]) if self.client else {})
             tot = lambda xs, key: sum(x[key] or 0 for x in xs)
@@ -1317,7 +1424,7 @@ def _json_default(o):
 
 
 def snapshot_items(paths):
-    """Yield (t, items, ticks, tick_gap, feed_lag) from recorded snapshot files (used by replay)."""
+    """Yield (t, items, ticks, tick_gap, env) from recorded snapshot files (used by replay)."""
     def lines():
         for path in paths:
             with gzip.open(path, "rt", encoding="utf8") as fh:
@@ -1326,13 +1433,14 @@ def snapshot_items(paths):
 
 
 def snapshot_records(lines):
-    """Yield (t, items, ticks, tick_gap, feed_lag) from recorded snapshot lines. ticks is None when the trade feed
-    wasn't running for that poll; tick_gap is True where it restarted and "stop" where it went down; feed_lag is how
-    far the pump.fun trade stream ran behind the chain (0 without it), which fills are delayed by. Token metadata carries across files, so rows near an hour boundary aren't dropped.
+    """Yield (t, items, ticks, tick_gap, env) from recorded snapshot lines. ticks is None when the trade feed wasn't
+    running for that poll; tick_gap is True where it restarted and "stop" where it went down; env holds the recorded
+    conditions: "lag", how far pump.fun's trade stream ran behind the chain (0 without it), which fills are delayed
+    by, and "txCost", what a transaction cost to land in USD (None: not measured, gasUsd applies). Token metadata carries across files, so rows near an hour boundary aren't dropped.
     Rows are pons rows ("u") or compact pump.fun rows ("v")."""
     meta = {}
     last_t = None
-    lag = 0.0
+    lag, cost = 0.0, None
     for line in lines:
         line = line.strip()
         if not line:
@@ -1368,5 +1476,7 @@ def snapshot_records(lines):
             lag = 0.0
         elif rec.get("lag") is not None:
             lag = rec["lag"]
+        if rec.get("fee") is not None:
+            cost = rec["fee"]
         # tick gap: True = the trade feed restarts here, "stop" = it was down from here on (pump.fun stream)
-        yield rec["t"], items, rec.get("x"), "stop" if rec.get("xs") else bool(rec.get("xg")), lag
+        yield rec["t"], items, rec.get("x"), "stop" if rec.get("xs") else bool(rec.get("xg")), {"lag": lag, "txCost": cost}

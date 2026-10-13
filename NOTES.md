@@ -34,18 +34,18 @@ state, 250 ms reactions, per-coin fees. Still open:
   websocket's ~1.3 s.
 - **Check the free websocket on Render.** The public endpoint may refuse cloud servers. If the pill keeps saying
   "reconnecting", add a free Helius key as `SOLANA_RPC_URL` (its websocket is used automatically).
-- **Stream PumpSwap too.** Graduated coins still fill on the API with a modelled pool, and their per-trade signals
-  stop at graduation. PumpSwap logs `BuyEvent`/`SellEvent` with pool reserves (pump_amm IDL).
-- **Real transaction costs and failures, measured from the chain** (needs gRPC: full transactions). `gasUsd` is a flat
-  $0.05 and only slippage reverts. Read the priority fees and Jito tips paid by trades in the same coin and moment,
-  and how often pump.fun buys fail on slippage (failed transactions still pay fees), and charge orders the same.
-- **Dropped transactions.** Sometimes an order never lands, and a stop loss goes out again a slot or two later.
-- **Token account rent.** A first buy of a coin locks about 0.002 SOL, refunded when the position is closed out.
-- **Calibrate with real trades.** A small live mode: real $2–5 orders from your own wallet, logged next to the paper
-  fill for the same signal, to measure our own landing time, failure rate and fees (you run it, not the assistant).
+- **Run a calibration.** `python -m ponspaper calibrate --keypair <wallet.json>` (dry run first, then `--live` with
+  a few cents per trade) measures your own landing time, drops and costs; put its suggested Latency, Latency jitter
+  and Dropped transactions into Settings. Until then, 5% dropped is an estimate.
+- **PumpSwap per-trade signals.** Streamed pools give graduated coins real prices and fees, but trades/min, buyers,
+  holders etc. still stop at graduation: the recording would need to mark which pools were streamed when.
+- **Bandwidth on Render.** The websocket stream with 25 pools is roughly 0.4 MB/s in. If Render's CPU struggles
+  (watch the stream pill's lag), lower *PumpSwap pools streamed*, or use gRPC, which filters on the server.
 
 Done: orders fill on the slot they land in (the stream's lag is measured from block times and recorded, so the lab
 and replays fill the same way). Solana slots are ~0.21 s now (Oct 2026), measured by the stream, not assumed.
+Transaction costs are measured from real trades, dropped transactions and token account rent are modelled, graduated
+coins fill on their streamed PumpSwap pool, and `calibrate` measures all of it with real orders.
 
 ## Smaller follow-ups found along the way
 

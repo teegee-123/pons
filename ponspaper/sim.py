@@ -10,6 +10,10 @@ from .market import curve_params
 # pump.fun a sell is priced on the curve as it would stand with our buy in it, so a round trip with nobody else
 # trading returns what went in minus fees (about 3% better than the double-counted price for a $50 order at launch).
 OWN_BUY_IN_RESERVES = V.PUMP
+# pump.fun (curve and PumpSwap) charges a buy's fee on top of what goes into the reserves: spending S puts
+# S / (1 + fee) in. The pons curve takes it out of the input: S * (1 - fee). Checked against simulated pump.fun buys:
+# the difference is exactly the 0.0156% this makes at 1.25%.
+FEE_ON_TOP = V.PUMP
 
 
 def sell_gross(Q, T, tokens):
@@ -40,7 +44,7 @@ class Venue:
 
     def buy(self, quote_in):
         """-> (tokens_out, quote_used). quote_used < quote_in only when the buy completes the curve."""
-        keep = 1.0 - self.fee_frac
+        keep = 1.0 / (1.0 + self.fee_frac) if FEE_ON_TOP else 1.0 - self.fee_frac
         net = quote_in * keep
         out = net * self.T / (self.Q + net)
         if out > self.sellable:
@@ -65,6 +69,11 @@ def model_venue(d, ex):
         if q and t:  # pump.fun: the fee the coin's on-chain trades were charged, once the trade stream has seen one
             fee = d["feeBps"] if d.get("feeBps") is not None else ex["protocolFeeBps"]
             return Venue("curve", q, t, max(0.0, sellable or 0.0), fee, tax)
+    if d.get("stage") == "graduated" and d.get("pool"):  # pump.fun: the PumpSwap pool as streamed, with its own fee
+        q, t = d["pool"]
+        if q and t:
+            fee = d["poolFeeBps"] if d.get("poolFeeBps") is not None else ex["hookFeeBps"]
+            return Venue("pool", q, t, float("inf"), fee, tax)
     if d.get("stage") == "graduated" and d.get("poolK") and p:
         mult = max(0.05, float(ex.get("gradLiquidityMult", 1.0)))
         kp = d["poolK"] * mult * mult
@@ -102,7 +111,7 @@ def liquidation_usd(d, tokens, ex):
 class Position:
     __slots__ = ("id", "addr", "symbol", "t_entry", "tokens", "cost_usd", "entry_spot_usd", "feats", "peak_ret",
                  "mark_usd", "mark_ret", "exiting", "sell_fails", "stage", "entry_drift", "fees_usd", "src",
-                 "under_since")
+                 "under_since", "rent_usd")
 
     def __init__(self, **kw):
         for k in self.__slots__:
@@ -113,6 +122,7 @@ class Position:
         self.exiting = False
         self.sell_fails = self.sell_fails or 0
         self.fees_usd = self.fees_usd or 0.0
+        self.rent_usd = self.rent_usd or 0.0  # token account rent locked while the position is open (pump.fun)
 
     def to_dict(self):
         d = {k: getattr(self, k) for k in self.__slots__}
@@ -143,7 +153,7 @@ class Portfolio:
         return sum(p.mark_usd - p.cost_usd for p in self.positions.values())
 
     def equity(self):
-        return self.cash + sum(self.reserved.values()) + sum(p.mark_usd for p in self.positions.values())
+        return self.cash + sum(self.reserved.values()) + sum(p.mark_usd + p.rent_usd for p in self.positions.values())
 
     def sample_equity(self, t, max_points=720):
         eq = self.equity()

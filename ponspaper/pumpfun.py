@@ -11,8 +11,9 @@ One coin is re-read with /coins-v2/{mint} (edge-map horizons, coins Solana can't
 
 Prices: the bonding curve is constant product on virtual reserves. Open positions and fills on curve coins use the
 curve account read from Solana (solana.py); everything else uses the reserves the API returns. Graduated coins
-trade in a PumpSwap pool, modelled as a constant-product pool seeded the way pump.fun migrates (the curve's
-closing price, with the 206.9M tokens kept back from the curve), at the current market-cap price.
+trade in a PumpSwap pool: priced on the pool's own reserves (plus its virtual quote reserve) and fees when the
+trade stream watches it (apply_pool), else modelled as a constant-product pool seeded the way pump.fun migrates
+(the curve's closing price, with the 206.9M tokens kept back from the curve), at the current market-cap price.
 """
 import urllib.parse
 
@@ -38,6 +39,14 @@ CONFIG = {
                                    # trades show its fee (some coins' creators charge 1%: 195 bps)
         "hookFeeBps": 125,         # PumpSwap after graduation: tiered by market cap, 1.25% for small coins
         "useChainQuotes": True,    # fill on the curve / pool read from Solana when the order lands
+        # what landing a transaction costs, measured: the 75th percentile of what recent pump.fun trades paid (network
+        # fee + priority fee + tips, read from Solana every 8 s). gasUsd applies until 30 have been read.
+        "measuredTxCost": True, "txCostPct": 75,
+        # transactions that never land and are sent again: an estimate (5%, resent after 1 s) until real orders measure it
+        "dropPct": 5.0, "dropRetryMs": 1000,
+        # rent of the token account a buy creates (a 170-byte Token-2022 account: 0.00151384 SOL in real pump.fun buys,
+        # Oct 2026), returned when the account is closed on the sell
+        "accountRentSol": 0.00151384,
     },
     # Coins the simulator can't price are left out:
     # - curve depth: normal curves start at 30 SOL (~$3k); non-standard ones can hold well under 1 SOL, where a $50
@@ -68,7 +77,7 @@ CONFIG = {
     # every curve trade, launch and graduation straight from Solana (pumpstream.py): gRPC when SOLANA_GRPC_URL is set,
     # else the free websocket. Strategies decide, positions are marked and orders fill on the stream's curve state,
     # reacting every reactMs instead of every poll.
-    "stream": {"enabled": True, "source": "auto", "reactMs": 250},
+    "stream": {"enabled": True, "source": "auto", "reactMs": 250, "maxPools": 25},
 }
 
 # Starter manual strategies, scaled to pump.fun (launch ~$3k market cap, graduation ~$45k at $110/SOL).
@@ -166,6 +175,7 @@ def normalize(x, partial=False):
         "reserves": [vq, vt, rt] if on_curve and rt is not None else None,
         "poolK": None, "launchPriceQuote": None,
         "athMcapUsd": _num(x, "ath_market_cap"), "replies": x.get("reply_count"), "isLive": x.get("is_currently_live"),
+        "poolAddress": x.get("pool_address") if complete else None,  # its PumpSwap pool
         "mayhem": None if partial else bool(x.get("mayhem_state")),  # lists omit it for normal coins
     }
     if on_curve and rq is not None and rt is not None and vt - rt + CURVE_TOKENS > 0:
@@ -203,6 +213,21 @@ def apply_stream(d, st, t):
     n["lastTradeAt"] = max(t, d.get("lastTradeAt") or 0)
     if st.get("feeBps") is not None:
         n["feeBps"] = st["feeBps"]
+    return n
+
+
+def apply_pool(d, st, t):
+    """Token dict of a graduated coin updated with its PumpSwap pool after its latest trade on the trade stream:
+    pool = [quote reserve incl. virtual, base reserve], poolFeeBps = LP + protocol + coin-creator fee."""
+    n = dict(d)
+    price = st["Q"] / st["T"]
+    qu = d.get("quoteUsd")
+    n.update(stage="graduated", reserves=None, progress=1.0, pool=[st["Q"], st["T"]], priceQuote=price,
+             priceUsd=price * qu if qu else None,
+             marketCapUsd=price * qu * (d.get("supply") or 1e9) if qu else d.get("marketCapUsd"),
+             lastTradeAt=max(t, d.get("lastTradeAt") or 0))
+    if st.get("feeBps") is not None:
+        n["poolFeeBps"] = st["feeBps"]
     return n
 
 
@@ -246,8 +271,9 @@ def record_meta(d):
 def record_row(d):
     """Compact recording row; everything else is derived again on replay (see expand_row).
     curve:     [mint, "c", lastTradeAt, quoteUsd, athMcapUsd, replies, live, Q, T, sellable(, feeBps)]
-    graduated: [mint, "g", lastTradeAt, quoteUsd, athMcapUsd, replies, live, priceQuote, poolK]
-    feeBps: the curve fee the coin's on-chain trades were charged (protocol + its creator fee), once known."""
+    graduated: [mint, "g", lastTradeAt, quoteUsd, athMcapUsd, replies, live, priceQuote, poolK(, Q, T, poolFeeBps)]
+    feeBps: the curve fee the coin's on-chain trades were charged (protocol + its creator fee), once known.
+    Q, T, poolFeeBps: the PumpSwap pool's reserves (quote incl. virtual) and fee, when the trade stream watched it."""
     live = d.get("isLive")
     head = [d["address"], "g" if d.get("stage") == "graduated" else "c",
             round(d["lastTradeAt"], 1) if d.get("lastTradeAt") else None, _sig(d.get("quoteUsd")),
@@ -255,7 +281,10 @@ def record_row(d):
     if head[1] == "c":
         row = head + [_sig(x) for x in (d.get("reserves") or [None, None, None])]
         return row + [d["feeBps"]] if d.get("feeBps") is not None else row
-    return head + [_sig(d.get("priceQuote"), 9), _sig(d.get("poolK"))]
+    row = head + [_sig(d.get("priceQuote"), 9), _sig(d.get("poolK"))]
+    if d.get("pool"):
+        row += [_sig(d["pool"][0]), _sig(d["pool"][1]), d.get("poolFeeBps")]
+    return row
 
 
 def expand_row(row, meta):
@@ -266,6 +295,8 @@ def expand_row(row, meta):
     raised = None
     if graduated:
         price, d["poolK"], d["reserves"] = row[7], row[8], None
+        if len(row) > 10 and row[9] and row[10]:
+            d["pool"], d["poolFeeBps"] = [row[9], row[10]], row[11] if len(row) > 11 else None
     else:
         d["reserves"], d["poolK"] = row[7:10], None
         d["feeBps"] = row[10] if len(row) > 10 else None

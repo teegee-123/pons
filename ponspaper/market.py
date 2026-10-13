@@ -113,6 +113,8 @@ class Token:
             d["mayhem"] = old["mayhem"]
         if d.get("feeBps") is None and old.get("feeBps") is not None:  # learnt from on-chain trades, not the API
             d["feeBps"] = old["feeBps"]
+        if d.get("poolAddress") is None and old.get("poolAddress"):  # from the migration event, before the API has it
+            d["poolAddress"] = old["poolAddress"]
         if V.PUMP and d.get("stage") == "graduated" and old.get("stage") != "graduated":
             self.end_watch()  # PumpSwap trades aren't streamed: per-trade signals stop here
         changed = (d.get("lastTradeAt") != old.get("lastTradeAt") or d.get("raisedQuote") != old.get("raisedQuote")
@@ -277,6 +279,8 @@ class Token:
         res, pool_k, p = d.get("reserves"), d.get("poolK"), d.get("priceQuote")
         if curve and res and res[0] and qu:
             out["depthUsd"] = res[0] * qu
+        elif not curve and d.get("pool") and qu:  # the PumpSwap pool's quote reserve (incl. virtual), as streamed
+            out["depthUsd"] = d["pool"][0] * qu
         elif not curve and pool_k and p and qu:  # the modelled pool's quote reserve
             out["depthUsd"] = math.sqrt(pool_k * p) * qu
         else:

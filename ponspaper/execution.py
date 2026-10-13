@@ -109,7 +109,7 @@ class LiveExecutor:
 
     def _fill(self, orders):
         eng = self.engine
-        ex = eng.cfg["execution"]
+        ex = eng.ex()
         results = [None] * len(orders)
         toks = [eng.market.get(o["addr"]) for o in orders]
         if ex.get("useChainQuotes", True) and eng.chain is not None:
@@ -141,9 +141,9 @@ class LiveExecutor:
             if d is None:
                 continue
             st = stream.curve(d["address"]) if stream is not None else None
-            if st is not None and st.get("complete"):  # moved to PumpSwap: filled from a fresh API read
+            if st is not None and st.get("complete"):  # moving to PumpSwap: filled from a fresh API read
                 continue
-            if st is not None and d.get("stage") != "graduated":
+            if st is not None and (st.get("pool") or d.get("stage") != "graduated"):  # its curve or its PumpSwap pool
                 results[i] = self._stream_fill(o, d, ex, now)
             if results[i] is None:
                 rest[d["address"]] = d
@@ -180,7 +180,11 @@ class LiveExecutor:
         st = stream.landing_state(o["addr"], o["land_slot"], self.rng)
         if st is None:
             return None
-        v = Venue("curve", st["Q"], st["T"], st["sellable"], _fee(st, d, ex), d.get("creatorTaxBps") or 0, src="stream")
+        if st["pool"]:
+            v = Venue("pool", st["Q"], st["T"], st["sellable"], st["feeBps"] if st["feeBps"] is not None else ex["hookFeeBps"],
+                      d.get("creatorTaxBps") or 0, src="stream")
+        else:
+            v = Venue("curve", st["Q"], st["T"], st["sellable"], _fee(st, d, ex), d.get("creatorTaxBps") or 0, src="stream")
         r = fill_with_venue(o, v, d.get("quoteUsd"), ex, o["due"])
         r["slot"] = (o["land_slot"], st["before"], st["inSlot"])
         return r
@@ -296,7 +300,7 @@ class ReplayExecutor:
             batch.append(heapq.heappop(self.heap)[2])
         if not batch:
             return
-        ex = self.engine.cfg["execution"]
+        ex = self.engine.ex()
         results = []
         for o in batch:
             tok = self.engine.market.get(o["addr"])

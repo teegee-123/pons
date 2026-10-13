@@ -36,7 +36,7 @@ import time
 
 from . import strategy as S
 from .market import Market
-from .sim import model_venue, sell_gross
+from .sim import FEE_ON_TOP, model_venue, sell_gross
 
 CLONE = -1000.0  # fitness given to a genome that duplicates another's trades
 SERIES_CAP = 160  # long-run record: chart points per genome; when full, neighbours merge so it spans the whole life
@@ -80,8 +80,10 @@ class Dataset:
         t_yield = time.time()
         self.tick_rows = 0
         self.lag_t, self.lag_v = [], []  # the trade stream's recorded lag behind the chain, from each time on
+        self.cost_t, self.cost_v = [], []  # the recorded cost of landing a transaction (USD), from each time on
         self.streamed = 0.0         # seconds of recording with the trade stream running
-        for t, items, ticks, tick_gap, lag in records:
+        for t, items, ticks, tick_gap, env in records:
+            lag, cost = env["lag"], env["txCost"]
             prev = self.t1
             if self.t0 is None:
                 self.t0 = t
@@ -93,6 +95,9 @@ class Dataset:
             if lag != (self.lag_v[-1] if self.lag_v else 0.0):
                 self.lag_t.append(t)
                 self.lag_v.append(lag)
+            if cost is not None and cost != (self.cost_v[-1] if self.cost_v else None):
+                self.cost_t.append(t)
+                self.cost_v.append(cost)
             pending = []
             for d in items:
                 a = d["address"]
@@ -156,6 +161,11 @@ class Dataset:
         """Share of the recording with pump.fun's trade stream running."""
         return self.streamed / self.covered if self.covered else 0.0
 
+    def cost_at(self, t, default):
+        """The recorded cost of landing a transaction at time t (USD), or `default` where none was recorded."""
+        i = bisect.bisect_right(self.cost_t, t) - 1
+        return self.cost_v[i] if i >= 0 else default
+
     def lag_at(self, t):
         """The trade stream's lag behind the chain at time t (0 without a stream)."""
         i = bisect.bisect_right(self.lag_t, t) - 1
@@ -174,12 +184,13 @@ class Dataset:
 
 def _buy(p, quote_in):
     Q, T, sellable, ff, qu, _ = p
-    net = quote_in * (1.0 - ff)
+    keep = 1.0 / (1.0 + ff) if FEE_ON_TOP else 1.0 - ff  # as sim.Venue.buy
+    net = quote_in * keep
     out = net * T / (Q + net)
     if out > sellable:
         out = max(0.0, sellable)
         need = out * Q / max(1e-30, T - out)
-        return out, min(quote_in, need / (1.0 - ff))
+        return out, min(quote_in, need / keep)
     return out, quote_in
 
 
@@ -222,7 +233,9 @@ class Evaluator:
         self.max_open = int(sizing["maxOpen"])
         self.bankroll = float(sizing["bankrollUsd"])
         self.cooldown = float(sizing.get("cooldownMin") or 0) * 60
-        self.lat = ex["latencyMs"] / 1000.0 + extra_latency
+        # average landing time: latency (jitter averages out) plus the expected resends of dropped transactions
+        p, retry = float(ex.get("dropPct") or 0) / 100.0, float(ex.get("dropRetryMs") or 1000) / 1000.0
+        self.lat = ex["latencyMs"] / 1000.0 + extra_latency + retry * (p + p * p + p ** 3)
         self.gas = ex["gasUsd"]
         self.tol = ex["buySlippagePct"] / 100.0
         self.memo = {}
@@ -237,6 +250,7 @@ class Evaluator:
         ds = self.ds
         t_sig, i, _ = ds.cands[ci]
         times, pts = ds.pt[i], ds.pp[i]
+        gas = ds.cost_at(t_sig, self.gas)
         si = bisect.bisect_right(times, t_sig) - 1
         # the order lands `lat` after the signal and meets the chain as it was then, which the recording (made from
         # the trade stream) only shows the stream's lag later
@@ -244,16 +258,16 @@ class Evaluator:
         if si < 0 or fi < 0:
             self.memo[mk] = None
             return None
-        quote_in = (self.size - self.gas) / pts[si][4]
+        quote_in = (self.size - gas) / pts[si][4]
         exp, _ = _buy(pts[si], quote_in)
-        quote_in_f = (self.size - self.gas) / pts[fi][4]
+        quote_in_f = (self.size - gas) / pts[fi][4]
         tokens, used = _buy(pts[fi], quote_in_f)
         tokens *= 1.0 - self.extra_fee
         if tokens <= 0 or tokens < exp * (1.0 - self.tol):
             self.memo[mk] = None
             return None
         t_fill = t_sig + self.lat
-        cost = used * pts[fi][4] + self.gas
+        cost = used * pts[fi][4] + gas
         tp = xs.get("tpPct")
         sl = xs.get("slPct")
         tr = xs.get("trailPct")
@@ -272,7 +286,7 @@ class Evaluator:
         while True:
             p = pts[k]
             t_now = times[k] if k > fi else t_fill
-            ret = (_sell_usd(p, tokens) * (1.0 - self.extra_fee) - self.gas) / cost - 1.0
+            ret = (_sell_usd(p, tokens) * (1.0 - self.extra_fee) - gas) / cost - 1.0
             if ret > peak:
                 peak = ret
             if ret >= 0:
@@ -303,7 +317,7 @@ class Evaluator:
                 break
             k += 1
         ei = bisect.bisect_right(times, t_exit + self.lat + ds.lag_at(t_exit)) - 1 if reason != "end of data" else k
-        proceeds = _sell_usd(pts[ei], tokens) * (1.0 - self.extra_fee) - self.gas
+        proceeds = _sell_usd(pts[ei], tokens) * (1.0 - self.extra_fee) - gas
         r = (t_exit + (self.lat if reason != "end of data" else 0.0), cost, proceeds, reason)
         if len(self.memo) > 120000:  # keep memory bounded on small servers
             self.memo.clear()
@@ -356,7 +370,7 @@ class Evaluator:
             last_entry[i] = t
             out = self.outcome(ci, xs, xkey)
             if out is None:
-                cash -= self.gas
+                cash -= self.ds.cost_at(t, self.gas)
                 missed += 1
                 continue
             et, cost, proceeds, why = out

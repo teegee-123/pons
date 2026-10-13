@@ -115,9 +115,12 @@ function renderStream(st) {
     `Every pump.fun curve trade, launch and graduation from Solana${s.host ? " via " + esc(s.host) : ""}. ` +
     `Strategies decide, positions are marked and orders fill on it, every ${S.state.cfg.stream.reactMs} ms.` +
     `<br>events ${fNum(s.events, 0)} · trades ${fNum(s.trades, 0)} · coins tracked ${fNum(s.curves, 0)} · ${fNum(s.mbIn, 0)} MB received` +
+    `<br>PumpSwap pools streamed ${s.pools ?? 0} of ${s.poolsWanted ?? 0} wanted` + (s.poolErrors ? ` (${s.poolErrors} refused)` : "") +
     `<br>behind the chain: ${s.lagSec == null ? "–" : fNum(s.lagSec, 2) + " s"} (orders wait this long, then fill on the slot they landed in)` +
     (s.slotMs ? ` · slots ${fNum(s.slotMs, 0)} ms` : "") +
     `<br>reconnects ${s.reconnects}, outages ${st.streamOutages}, reaction pass ${st.streamTickMs ?? "–"} ms` +
+    (s.txCost && s.txCost.n ? `<br>landing a trade cost (last ${s.txCost.n} read): median ${fNum(s.txCost.p50 * 1e6, 0)}, p75 ${fNum(s.txCost.p75 * 1e6, 0)}, p90 ${fNum(s.txCost.p90 * 1e6, 0)} µSOL` +
+      (st.txCostUsd != null ? ` · orders pay ${fUsd(st.txCostUsd, 4)}` : "") : "") +
     (s.lastError ? "<br>last error: " + esc(s.lastError) : "") + (st.streamError ? "<br>" + esc(st.streamError) : "");
 }
 
